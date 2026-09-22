@@ -1,4 +1,4 @@
-# pi-agent
+# jarvis
 
 A small Discord-driven AI agent for a Raspberry Pi 3B+, built on [smolagents](https://github.com/huggingface/smolagents) with OpenRouter free models.
 
@@ -37,8 +37,8 @@ Use **Raspberry Pi OS Lite 64-bit (Bookworm or newer)**: the 32-bit OS often lac
 
 ```bash
 sudo apt install -y python3-venv git
-git clone https://github.com/<you>/<your-fork>.git ~/pi-agent
-cd ~/pi-agent
+git clone https://github.com/<you>/<your-fork>.git ~/jarvis
+cd ~/jarvis
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # takes a few minutes on a 3B+
 cp .env.example .env && chmod 600 .env && nano .env   # GITHUB_ALLOWED_REPOS is required if you set a token
 .venv/bin/python run.py                        # try it in the foreground first (NOT main.py - see below)
@@ -46,12 +46,12 @@ cp .env.example .env && chmod 600 .env && nano .env   # GITHUB_ALLOWED_REPOS is 
 
 Run as a service (edit the `User`/paths in the unit if you're not `pi`):
 ```bash
-sudo cp pi-agent.service /etc/systemd/system/
-sudo systemctl enable --now pi-agent
-journalctl -u pi-agent -f
+sudo cp jarvis.service /etc/systemd/system/
+sudo systemctl enable --now jarvis
+journalctl -u jarvis -f
 ```
 
-`pi-agent.service` and the instructions above run **`run.py`**, not `main.py` directly. `run.py` is a tiny wrapper: it checks whether the last `!update` needs to be rolled back before each boot, then execs into `main.py`. Running `main.py` directly still works, it just skips that boot-time safety net.
+`jarvis.service` and the instructions above run **`run.py`**, not `main.py` directly. `run.py` is a tiny wrapper: it checks whether the last `!update` needs to be rolled back before each boot, then execs into `main.py`. Running `main.py` directly still works, it just skips that boot-time safety net.
 
 Idle memory is roughly 100-150 MB; the unit caps it at 600 MB so a runaway restarts instead of freezing the Pi.
 
@@ -72,7 +72,7 @@ DM the bot, `@mention` it, or (if `DISCORD_CHANNEL_IDS` is set) just talk in tha
 | `!update` | Pull the latest commit from your GitHub repo (after checking CI) and restart |
 | `!rollback` | Undo the last `!update` |
 
-Examples: *"is CI green on PR 12?"* · *"what's going on across my repos?"* · *"remember that I prefer tabs"* · *"what changed in pi-agent this week?"* · *"review PR 12 on site"* · *"fix the typo in README of site and open a PR"* · *"search for smolagents release notes"*
+Examples: *"is CI green on PR 12?"* · *"what's going on across my repos?"* · *"remember that I prefer tabs"* · *"what changed in jarvis this week?"* · *"review PR 12 on site"* · *"fix the typo in README of site and open a PR"* · *"search for smolagents release notes"*
 
 Only one task runs at a time; others queue.
 
@@ -91,7 +91,7 @@ Requires `SELF_REPO` set (or auto-detected from `git clone`), that repo listed i
 - **Friction log** (`friction.py`, `data/friction.jsonl`): the *runtime* - not the model - records tool errors, LLM fallbacks/timeouts, step-limit hits, `!stop`, and denied actions. This is deliberate: letting the model self-report "pain points" is unreliable and a malicious web page could plant fake ones. Your own `!feedback` is recorded the same way and carries the most weight.
 - **Weekly self-review** (`SELF_REVIEW_DAY`/`TIME`, default Sunday 09:00): summarizes that log and, if there's enough to act on (`SELF_REVIEW_MIN_EVENTS`, or any `!feedback` at all), runs a read-only agent task that skims the relevant code and **files GitHub issues** - specific, with evidence, at most 3 per run, skipping near-duplicates. It never opens PRs or edits files. Run it on demand with `!improve` (`!improve force` to ignore the threshold).
 - **`!implement <n>`**: a separate, focused task reads issue `n` and opens a **draft** pull request implementing it, adding a new test file if behaviour changed. You review and merge (or close) it like any other PR - nothing here merges automatically.
-- **Protected files**: in its own repo, the agent can never edit `tools.py`, `main.py`, `config.py`, `ghclient.py`, `run.py`, `updater.py`, `pi-agent.service`, `requirements*.txt`, `.github/*`, or existing files under `tests/` (new test files are fine) - the files that hold the safety logic, the launcher, and the CI that judges its own PRs. `PROTECTED_PATHS` adds more. This is checked on every edit and again on the full PR diff, so it can't be routed around through another tool or a branch it didn't create through `gh_edit_file`. A human makes those changes.
+- **Protected files**: in its own repo, the agent can never edit `tools.py`, `main.py`, `config.py`, `ghclient.py`, `run.py`, `updater.py`, `jarvis.service`, `requirements*.txt`, `.github/*`, or existing files under `tests/` (new test files are fine) - the files that hold the safety logic, the launcher, and the CI that judges its own PRs. `PROTECTED_PATHS` adds more. This is checked on every edit and again on the full PR diff, so it can't be routed around through another tool or a branch it didn't create through `gh_edit_file`. A human makes those changes.
 - **`!update`**: fetches your repo, refuses if there are local changes or the history has diverged, **checks that GitHub Actions CI passed** on the target commit (skips the update if it's failing or still running), then fast-forwards, reinstalls dependencies if `requirements.txt` changed, and runs a smoke test (`import` every module + parse your real `.env`) **before** restarting - if that fails, it resets to the previous commit and never restarts. You approve before anything happens. If the new code passes the smoke test but then crashes at boot, `run.py` retries a few times and then rolls back automatically. `!rollback` reverts the last update by hand at any time.
 - Turn it off entirely with `SELF_REVIEW_DAY=off` (review) or by leaving `SELF_REPO` unset / out of `GITHUB_ALLOWED_REPOS` (review, `!implement`, and `!update`'s CI-aware fast-forwarding all need it - `!update` still works generically on any git checkout without it, just without the "is this my own repo" framing).
 
