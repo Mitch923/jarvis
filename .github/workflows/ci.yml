@@ -1,0 +1,32 @@
+# Runs the test suite on every push and PR (including the agent's own PRs from agent/* branches
+# and its draft self-PRs). !update in Discord checks this commit's result before installing it -
+# don't rename the "test" job below without updating updater.py's expectations.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - run: pip install -r requirements.txt pyflakes
+
+      - run: python -m pyflakes *.py
+        name: Lint (core files must be warning-free; tests are exempt)
+
+      - run: python tests/run_all.py
+        name: Test suite

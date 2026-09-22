@@ -1,0 +1,184 @@
+"""Configuration, loaded once from environment variables (or a .env file)."""
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+def _str(name: str, default: str = "") -> str:
+    return os.environ.get(name, default).strip()
+
+
+def _int(name: str, default: int) -> int:
+    raw = _str(name)
+    return int(raw) if raw else default
+
+
+def _float(name: str, default: float) -> float:
+    raw = _str(name)
+    return float(raw) if raw else default
+
+
+def _bool(name: str, default: bool) -> bool:
+    raw = _str(name).lower()
+    return default if not raw else raw in {"1", "true", "yes", "on"}
+
+
+def _csv(name: str) -> tuple[str, ...]:
+    return tuple(p.strip() for p in _str(name).split(",") if p.strip())
+
+
+class ConfigError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class Config:
+    # --- Discord ---
+    discord_token: str
+    allowed_user_ids: frozenset[int]  # ONLY these users can talk to the bot
+    primary_user_id: int  # first ID listed: receives watcher alerts and the daily digest
+    channel_ids: frozenset[int]  # channels where the bot answers without @mention
+
+    # --- LLM (OpenRouter) ---
+    openrouter_key: str
+    openrouter_base: str
+    models: tuple[str, ...]  # tried in order; "auto" expands to discovered free models
+    auto_models_limit: int
+    llm_timeout: float  # seconds per HTTP request
+    llm_call_deadline: float  # seconds for one generate() incl. all retries/fallbacks
+    llm_attempts_per_model: int
+    max_tokens: int
+    temperature: float
+
+    # --- Agent ---
+    agent_type: str  # "tool" (safer) or "code"
+    max_steps: int
+    run_timeout: float  # wall-clock seconds for one whole task
+    history_turns: int
+    tool_output_chars: int
+    timezone: str
+
+    # --- GitHub ---
+    github_token: str
+    github_api_url: str
+    github_owner: str
+    github_allowed_repos: frozenset[str]
+    github_write: bool
+    branch_prefix: str
+    approval_mode: str  # "all" | "publish" | "none"
+    approval_timeout: float
+
+    # --- Background jobs (no LLM involved, so they cost no free-tier requests) ---
+    notify_channel_id: int  # 0 = DM the primary user
+    watch_interval: float  # seconds between GitHub polls; 0 = watcher off
+    digest_time: str  # "HH:MM" in AGENT_TIMEZONE; "" = no daily digest
+
+    # --- Self-improvement ---
+    self_repo: str  # this bot's own GitHub repo (owner/name); blank = detect from the git checkout
+    self_review_day: int  # 0=Mon .. 6=Sun, -1 = weekly review off
+    self_review_time: str
+    self_review_min_events: int  # fewer problem events than this -> skip the (LLM-costing) review
+    improve_max_steps: int  # step budget for self-review / implement runs
+    protected_paths: tuple[str, ...]  # extra globs the agent may never edit in its own repo
+
+    # --- Storage ---
+    data_dir: str
+    memory_max_notes: int
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        load_dotenv()
+
+        missing = [k for k in ("DISCORD_TOKEN", "OPENROUTER_API_KEY", "DISCORD_ALLOWED_USER_IDS") if not _str(k)]
+        if missing:
+            raise ConfigError(f"Missing required settings: {', '.join(missing)} (see .env.example)")
+
+        try:
+            allowed_list = [int(x) for x in _csv("DISCORD_ALLOWED_USER_IDS")]
+            channels = frozenset(int(x) for x in _csv("DISCORD_CHANNEL_IDS"))
+            notify_channel = _int("NOTIFY_CHANNEL_ID", 0)
+        except ValueError as e:
+            raise ConfigError(f"Discord IDs must be numbers: {e}") from e
+
+        repos = frozenset(r.lower().removeprefix("https://github.com/").strip("/") for r in _csv("GITHUB_ALLOWED_REPOS"))
+        bad = [r for r in repos if not re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", r)]
+        if bad:
+            raise ConfigError(f"GITHUB_ALLOWED_REPOS entries must look like owner/name: {', '.join(bad)}")
+        if _str("GITHUB_TOKEN") and not repos and not _bool("GITHUB_ALLOW_ALL", False):
+            raise ConfigError(
+                "GITHUB_TOKEN is set but GITHUB_ALLOWED_REPOS is empty. List the repos the agent may see "
+                "(free models can log prompts), or set GITHUB_ALLOW_ALL=1 to accept the risk."
+            )
+
+        self_repo = _str("SELF_REPO").lower().removeprefix("https://github.com/").strip("/")
+        if self_repo and not re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", self_repo):
+            raise ConfigError("SELF_REPO must look like owner/name")
+        days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+        day = _str("SELF_REVIEW_DAY", "sun").lower()[:3]
+        if day != "off" and day not in days:
+            raise ConfigError("SELF_REVIEW_DAY must be mon..sun or off")
+        review_time = _str("SELF_REVIEW_TIME", "09:00")
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", review_time):
+            raise ConfigError("SELF_REVIEW_TIME must be HH:MM (24h)")
+
+        digest = _str("DIGEST_TIME", "08:00")
+        if digest and not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", digest):
+            raise ConfigError("DIGEST_TIME must be HH:MM (24h), or empty to disable")
+
+        agent_type = _str("AGENT_TYPE", "tool").lower()
+        if agent_type not in {"tool", "code"}:
+            raise ConfigError("AGENT_TYPE must be 'tool' or 'code'")
+
+        approval = _str("APPROVAL_MODE", "publish").lower()
+        if approval not in {"all", "publish", "none"}:
+            raise ConfigError("APPROVAL_MODE must be 'all', 'publish' or 'none'")
+
+        prefix = _str("AGENT_BRANCH_PREFIX", "agent/")
+        if not prefix:
+            raise ConfigError("AGENT_BRANCH_PREFIX must not be empty (it protects your real branches)")
+
+        return cls(
+            discord_token=_str("DISCORD_TOKEN"),
+            allowed_user_ids=frozenset(allowed_list),
+            primary_user_id=allowed_list[0],
+            channel_ids=channels,
+            openrouter_key=_str("OPENROUTER_API_KEY"),
+            openrouter_base=_str("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/"),
+            models=_csv("MODELS") or ("openrouter/free", "auto"),
+            auto_models_limit=_int("AUTO_MODELS_LIMIT", 4),
+            llm_timeout=_float("LLM_TIMEOUT", 60),
+            llm_call_deadline=_float("LLM_CALL_DEADLINE", 150),
+            llm_attempts_per_model=max(1, _int("LLM_ATTEMPTS_PER_MODEL", 2)),
+            max_tokens=_int("LLM_MAX_TOKENS", 2048),
+            temperature=_float("LLM_TEMPERATURE", 0.2),
+            agent_type=agent_type,
+            max_steps=_int("MAX_STEPS", 8),
+            run_timeout=_float("RUN_TIMEOUT", 420),
+            history_turns=_int("HISTORY_TURNS", 6),
+            tool_output_chars=_int("TOOL_OUTPUT_CHARS", 8000),
+            timezone=_str("AGENT_TIMEZONE", "UTC"),
+            github_token=_str("GITHUB_TOKEN"),
+            github_api_url=_str("GITHUB_API_URL", "https://api.github.com").rstrip("/"),
+            github_owner=_str("GITHUB_OWNER"),
+            github_allowed_repos=repos,
+            github_write=_bool("GITHUB_WRITE", True),
+            branch_prefix=prefix,
+            approval_mode=approval,
+            approval_timeout=_float("APPROVAL_TIMEOUT", 180),
+            notify_channel_id=notify_channel,
+            watch_interval=0 if not _float("WATCH_INTERVAL", 300) else max(60.0, _float("WATCH_INTERVAL", 300)),
+            digest_time=digest,
+            self_repo=self_repo,
+            self_review_day=-1 if day == "off" else days.index(day),
+            self_review_time=review_time,
+            self_review_min_events=_int("SELF_REVIEW_MIN_EVENTS", 5),
+            improve_max_steps=_int("IMPROVE_MAX_STEPS", 14),
+            protected_paths=tuple(p.lower() for p in _csv("PROTECTED_PATHS")),
+            data_dir=_str("DATA_DIR") or str(Path(__file__).resolve().parent / "data"),
+            memory_max_notes=_int("MEMORY_MAX_NOTES", 40),
+        )
