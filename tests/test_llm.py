@@ -25,7 +25,7 @@ ok("plain success + max_tokens forwarded")
 m = new(); fake_llm.SCRIPT[:] = [("status", 500), ("status", 500)]
 t = time.time(); r = m.generate(msgs); 
 assert [s[0] for s in fake_llm.SEEN] == ["m1", "m1", "m2"], fake_llm.SEEN
-assert m.model_id == "m2"; assert m._cooldown["m1"] > time.time()
+assert m.model_id == "openrouter:m2"; assert m._cooldown[("openrouter", "m1")] > time.time()
 ok(f"5xx x2 -> fallback to m2 ({time.time()-t:.1f}s)")
 
 # 3. cooldown: next call skips m1
@@ -65,7 +65,7 @@ ok("upstream 429 -> next model without retrying")
 
 # 9. 404 model gone -> long cooldown, next model
 m = new(); fake_llm.SCRIPT[:] = [("status", 404, "No endpoints found")]
-r = m.generate(msgs); assert m._cooldown["m1"] - time.time() > 1000
+r = m.generate(msgs); assert m._cooldown[("openrouter", "m1")] - time.time() > 1000
 ok("404 -> 30 min cooldown, next model")
 
 # 10. 401 -> fatal
@@ -108,7 +108,7 @@ os.environ["LLM_CALL_DEADLINE"] = "25"
 # 15. tool calling: native tool call, prose -> final_answer, JSON-in-text -> tool call
 from smolagents import tool
 @tool
-def pi_status() -> str:
+def jarvis_status() -> str:
     """Status.
 
     """
@@ -121,19 +121,19 @@ def final_answer(answer: str) -> str:
         answer: text
     """
     return answer
-tools = [pi_status, final_answer]
-m = new(); fake_llm.SCRIPT[:] = [("tool", "pi_status", {})]
+tools = [jarvis_status, final_answer]
+m = new(); fake_llm.SCRIPT[:] = [("tool", "jarvis_status", {})]
 r = m.generate(msgs, tools_to_call_from=tools)
-assert r.tool_calls[0].function.name == "pi_status"
+assert r.tool_calls[0].function.name == "jarvis_status"
 assert fake_llm.SEEN[0][1] is True and fake_llm.SEEN[0][2] == "auto" and fake_llm.SEEN[0][4] is None
 ok("native tool call passes through; tool_choice=auto; no stop param")
 m = new(); fake_llm.SCRIPT[:] = [("text", "Just prose answer")]
 r = m.generate(msgs, tools_to_call_from=tools)
 assert r.tool_calls[0].function.name == "final_answer" and r.tool_calls[0].function.arguments == {"answer": "Just prose answer"}
 ok("prose reply converted to final_answer")
-m = new(); fake_llm.SCRIPT[:] = [("json_text", "pi_status", {})]
+m = new(); fake_llm.SCRIPT[:] = [("json_text", "jarvis_status", {})]
 r = m.generate(msgs, tools_to_call_from=tools)
-assert r.tool_calls[0].function.name == "pi_status"
+assert r.tool_calls[0].function.name == "jarvis_status"
 ok("JSON-in-text tool call recovered")
 m = new(); fake_llm.SCRIPT[:] = [("json_text", "nonexistent_tool", {})]
 r = m.generate(msgs, tools_to_call_from=tools)

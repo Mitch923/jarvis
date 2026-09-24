@@ -1,15 +1,25 @@
-"""A smolagents model for OpenRouter's free tier that survives its flakiness.
+"""A smolagents model that cascades across several free/cheap OpenAI-compatible providers.
+
+Providers tried in the order configured (PROVIDERS): each provider's own models are tried in
+order before moving to the next provider. Built in: OpenRouter, Google AI Studio (Gemini),
+NVIDIA NIM, and an optional Ollama endpoint (local or remote, e.g. another PC on your LAN) -
+all speak the same OpenAI chat-completions API, so adding one more is a small, mechanical change.
 
 What it handles, per LLM call:
   * hard HTTP timeouts (no request can hang the agent)
   * 429 rate limits: waits (honouring Retry-After) for per-minute limits,
     fails fast and remembers it for the day-cap ("free-models-per-day")
   * 5xx / timeouts / connection drops / empty or malformed replies: retry, then
-    fall through to the next model in the list
+    fall through to the next model, then the next provider
   * 404 / 400 / 402: model was retired or can't do what we need -> cool it down
   * a per-call deadline and an abort switch so !stop and run timeouts work
   * models that answer in prose instead of calling a tool: the prose becomes the
     final answer instead of burning steps on parse errors
+
+The "daily cap" wording match in _classify() was written against OpenRouter's actual error
+text. Google/NVIDIA may phrase their own quota errors differently; when the wording isn't
+recognised, a daily cap still degrades safely to an ordinary rate-limited retry/fallback -
+it just won't get the precise "resets in Xh" message.
 """
 from __future__ import annotations
 
@@ -19,6 +29,7 @@ import random
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 import openai
@@ -59,6 +70,14 @@ class LLMAborted(LLMError):
 
 class _BadResponse(Exception):
     """HTTP 200, but the body was unusable (OpenRouter sometimes does this)."""
+
+
+@dataclass(frozen=True)
+class _Provider:
+    name: str
+    base_url: str
+    api_key: str  # may be "" (e.g. a local Ollama with no auth)
+    models: tuple[str, ...]  # explicit list; "auto" (OpenRouter only) is expanded at call time
 
 
 # How long a model is skipped after failing in each way (seconds).
@@ -109,7 +128,11 @@ def _classify(exc: BaseException) -> tuple[str, float | None]:
         if code in (402, 404):
             return "model_down", None  # retired / needs credits / no provider for our params
         if code == 429:
-            if "per-day" in msg or "per day" in msg or "daily" in msg:
+            # "resource_exhausted" is Google's own gRPC-derived error name for its daily quota;
+            # generic "quota" is deliberately NOT matched here since some providers use that word
+            # for ordinary per-minute limits too, and misclassifying those as "daily" is worse
+            # than just falling through to the generic rate-limit retry below.
+            if "per-day" in msg or "per day" in msg or "daily" in msg or "resource_exhausted" in msg:
                 return "daily", None
             if "upstream" in msg or "provider" in msg:
                 return "upstream", None
@@ -125,11 +148,13 @@ def _classify(exc: BaseException) -> tuple[str, float | None]:
 class ResilientModel(OpenAIServerModel):
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self._configured = list(cfg.models)
-        self._discovered: list[str] = []
+        self._providers = self._build_providers(cfg)
+        if not self._providers:
+            raise LLMFatalError("No usable LLM provider configured (check PROVIDERS and its API key).")
+        self._discovered: list[str] = []  # OpenRouter "auto" expansion only
         self._discovered_at = 0.0
-        self._cooldown: dict[str, float] = {}
-        self._daily_block_until = 0.0
+        self._cooldown: dict[tuple[str, str], float] = {}  # (provider, model) -> until timestamp
+        self._daily_block: dict[str, float] = {}  # provider -> until timestamp
         self._day = dt.datetime.now(dt.timezone.utc).date()
         self.requests_today = 0
         self.failures_today = 0
@@ -137,20 +162,41 @@ class ResilientModel(OpenAIServerModel):
         self.abort = threading.Event()
         self.on_event = None  # optional callable(kind, model=..., detail=...) for the friction log
 
-        first = next((m for m in self._configured if m != "auto"), "openrouter/free")
+        primary = self._providers[0]
+        placeholder = next((m for m in primary.models if m != "auto"), "model")
         super().__init__(
-            model_id=first,
-            api_base=cfg.openrouter_base,
-            api_key=cfg.openrouter_key,
+            model_id=f"{primary.name}:{placeholder}",
+            api_base=primary.base_url,
+            api_key=primary.api_key or "not-needed",  # the openai client rejects "" / None outright
             client_kwargs={
                 "timeout": cfg.llm_timeout,
                 "max_retries": 0,  # all retry logic lives here
-                "default_headers": {"X-Title": "pi-agent"},
+                "default_headers": {"X-Title": "jarvis"},
             },
             retry=False,  # disable smolagents' own (rate-limit-only, unbounded-sleep) retry
             temperature=cfg.temperature,
             max_tokens=cfg.max_tokens,
         )
+        # One openai.OpenAI client per provider (base_url/api_key are fixed per client in that SDK).
+        self._clients: dict[str, openai.OpenAI] = {primary.name: self.client}
+        for p in self._providers[1:]:
+            self._clients[p.name] = openai.OpenAI(
+                base_url=p.base_url,
+                api_key=p.api_key or "not-needed",
+                timeout=cfg.llm_timeout,
+                max_retries=0,
+                default_headers={"X-Title": "jarvis"},
+            )
+
+    @staticmethod
+    def _build_providers(cfg: Config) -> list[_Provider]:
+        by_name = {
+            "openrouter": _Provider("openrouter", cfg.openrouter_base, cfg.openrouter_key, cfg.models),
+            "google": _Provider("google", cfg.google_base, cfg.google_key, cfg.google_models),
+            "nvidia": _Provider("nvidia", cfg.nvidia_base, cfg.nvidia_key, cfg.nvidia_models),
+            "ollama": _Provider("ollama", cfg.ollama_base, "", cfg.ollama_models),
+        }
+        return [by_name[name] for name in cfg.providers if name in by_name]
 
     # ------------------------------------------------------------------ public
 
@@ -160,24 +206,16 @@ class ResilientModel(OpenAIServerModel):
     def stop(self) -> None:
         self.abort.set()
 
-    def models(self) -> list[str]:
-        """Configured models in order; the token 'auto' expands to discovered free models."""
-        out: list[str] = []
-        for m in self._configured:
-            for candidate in (self._discovered if m == "auto" else [m]):
-                if candidate not in out:
-                    out.append(candidate)
-        return out or ["openrouter/free"]
-
     def describe(self) -> str:
         self._rollover()
         now = time.time()
         lines = [f"Requests today (UTC): {self.requests_today} (failed: {self.failures_today})"]
-        if self._daily_block_until > now:
-            lines.append(f"⛔ Daily free quota exhausted, resets in {self._fmt_wait(self._daily_block_until - now)}")
-        for m in self.models():
-            left = self._cooldown.get(m, 0) - now
-            lines.append(f"• `{m}` — " + (f"cooling down {int(left)}s" if left > 0 else "ready"))
+        for p in self._providers:
+            blocked = self._daily_block.get(p.name, 0) - now
+            lines.append(f"**{p.name}**" + (f" — ⛔ day cap, resets in {self._fmt_wait(blocked)}" if blocked > 0 else ""))
+            for m in self._provider_models(p.name):
+                left = self._cooldown.get((p.name, m), 0) - now
+                lines.append(f"• `{m}` — " + (f"cooling down {int(left)}s" if left > 0 else "ready"))
         if self.last_error:
             lines.append(f"Last error: {self.last_error}")
         return "\n".join(lines)
@@ -200,32 +238,31 @@ class ResilientModel(OpenAIServerModel):
         errors: list[str] = []
         rate_waits = 0
 
-        for model_id in self._candidates():
+        for provider, model_id in self._candidates():
+            if self._daily_block.get(provider, 0) > time.time():
+                continue  # this provider got day-blocked earlier within this same call
             attempt = 0
             while attempt < self.cfg.llm_attempts_per_model:
                 self._check_abort(deadline)
                 try:
                     self.requests_today += 1
-                    return self._call(model_id, messages, stop_sequences, response_format, tools_to_call_from, **kwargs)
+                    return self._call(provider, model_id, messages, stop_sequences, response_format, tools_to_call_from, **kwargs)
                 except Exception as exc:  # noqa: BLE001 - classified below
                     kind, wait = _classify(exc)
                     if kind == "bug":
                         raise
+                    label = f"{provider}:{model_id}"
                     self.failures_today += 1
-                    self.last_error = f"{model_id}: {_short(exc, 120)}"
-                    errors.append(f"{model_id}: {_short(exc, 120)}")
-                    log.warning("LLM call failed [%s/%s]: %s", model_id, kind, _short(exc))
-                    self._emit(f"llm_{kind}", model_id, _short(exc, 150))
+                    self.last_error = f"{label}: {_short(exc, 120)}"
+                    errors.append(f"{label}: {_short(exc, 120)}")
+                    log.warning("LLM call failed [%s/%s]: %s", label, kind, _short(exc))
+                    self._emit(f"llm_{kind}", label, _short(exc, 150))
 
                     if kind == "fatal":
-                        raise LLMFatalError(
-                            "OpenRouter rejected the API key (401). Check OPENROUTER_API_KEY."
-                        ) from exc
+                        raise LLMFatalError(f"{provider} rejected its API key (401). Check that provider's API key setting.") from exc
                     if kind == "daily":
-                        self._block_until_midnight()
-                        raise LLMQuotaError(
-                            f"Daily free-model request cap reached. Resets in {self._fmt_wait(self._daily_block_until - time.time())}."
-                        ) from exc
+                        self._daily_block[provider] = self._midnight_utc()
+                        break  # try the next candidate - a different provider, if any is configured
                     if kind == "rate_wait":  # account-wide per-minute limit: waiting is the only fix
                         rate_waits += 1
                         if rate_waits > _MAX_RATE_WAITS:
@@ -235,18 +272,21 @@ class ResilientModel(OpenAIServerModel):
 
                     attempt += 1
                     if kind in _COOLDOWN:  # model-specific problem: move on immediately
-                        self._cooldown[model_id] = time.time() + _COOLDOWN[kind]
+                        self._cooldown[(provider, model_id)] = time.time() + _COOLDOWN[kind]
                         break
                     if attempt >= self.cfg.llm_attempts_per_model:
-                        self._cooldown[model_id] = time.time() + _TRANSIENT_COOLDOWN
+                        self._cooldown[(provider, model_id)] = time.time() + _TRANSIENT_COOLDOWN
                         break
                     self._sleep(min(2**attempt + random.random(), 8.0), deadline)
 
-        raise LLMUnavailableError("All models failed. " + " | ".join(errors[-3:]))
+        # If we get here, every candidate failed. If that's because every provider is now
+        # day-blocked, say so with reset times; otherwise it's an ordinary outage.
+        self._check_daily_block()
+        raise LLMUnavailableError("All providers/models failed. " + " | ".join(errors[-3:]))
 
     # ---------------------------------------------------------------- internals
 
-    def _call(self, model_id, messages, stop_sequences, response_format, tools, **kwargs) -> ChatMessage:
+    def _call(self, provider, model_id, messages, stop_sequences, response_format, tools, **kwargs) -> ChatMessage:
         params = self._prepare_completion_kwargs(
             messages=messages,
             # Native tool calling doesn't need stop sequences; skip them there.
@@ -261,10 +301,10 @@ class ResilientModel(OpenAIServerModel):
             tool_choice="auto",
             **kwargs,
         )
-        resp = self.client.chat.completions.create(**params)
+        resp = self._clients[provider].chat.completions.create(**params)
 
         choices = getattr(resp, "choices", None)
-        if not choices:  # OpenRouter can return HTTP 200 with {"error": {...}}
+        if not choices:  # some providers can return HTTP 200 with {"error": {...}}
             err = getattr(resp, "error", None) or (getattr(resp, "model_extra", None) or {}).get("error")
             raise _BadResponse(f"no choices in response ({err})")
         msg = choices[0].message
@@ -282,7 +322,7 @@ class ResilientModel(OpenAIServerModel):
             if usage
             else None,
         )
-        self.model_id = model_id  # so agent logs and the friction log show which model actually answered
+        self.model_id = f"{provider}:{model_id}"  # so agent logs and the friction log show which model answered
         if tools and not out.tool_calls:
             out = self._prose_to_tool_call(out, tools)
         return out
@@ -314,11 +354,37 @@ class ResilientModel(OpenAIServerModel):
             except Exception:  # noqa: BLE001 - diagnostics must never break a call
                 log.exception("friction hook failed")
 
-    def _candidates(self) -> list[str]:
-        models, now = self.models(), time.time()
-        ready = [m for m in models if self._cooldown.get(m, 0) <= now]
-        # If everything is cooling down, try the one that recovers first rather than failing instantly.
-        return ready or [min(models, key=lambda m: self._cooldown.get(m, 0))]
+    def _provider_models(self, name: str) -> list[str]:
+        """This provider's configured models, with OpenRouter's 'auto' expanded to discovered ones."""
+        p = next((p for p in self._providers if p.name == name), None)
+        if p is None:
+            return []
+        if name != "openrouter":
+            return list(p.models)
+        out: list[str] = []
+        for m in p.models:
+            for candidate in (self._discovered if m == "auto" else [m]):
+                if candidate not in out:
+                    out.append(candidate)
+        return out or ["openrouter/free"]
+
+    def _candidate_pairs(self) -> list[tuple[str, str]]:
+        """All (provider, model) pairs in try-order, skipping providers that are day-blocked."""
+        now = time.time()
+        return [
+            (p.name, m)
+            for p in self._providers
+            if self._daily_block.get(p.name, 0) <= now
+            for m in self._provider_models(p.name)
+        ]
+
+    def _candidates(self) -> list[tuple[str, str]]:
+        pairs, now = self._candidate_pairs(), time.time()
+        ready = [pr for pr in pairs if self._cooldown.get(pr, 0) <= now]
+        if ready:
+            return ready
+        # Nothing not-blocked is ready: try the one that recovers first rather than failing instantly.
+        return [min(pairs, key=lambda pr: self._cooldown.get(pr, 0))] if pairs else []
 
     def _check_abort(self, deadline: float) -> None:
         if self.abort.is_set():
@@ -338,24 +404,31 @@ class ResilientModel(OpenAIServerModel):
             self._day, self.requests_today, self.failures_today = today, 0, 0
 
     def _check_daily_block(self) -> None:
-        left = self._daily_block_until - time.time()
-        if left > 0:
-            raise LLMQuotaError(f"Daily free-model request cap reached. Resets in {self._fmt_wait(left)}.")
+        now = time.time()
+        if all(self._daily_block.get(p.name, 0) > now for p in self._providers):
+            raise LLMQuotaError(f"Daily free quota reached on every configured provider. {self._daily_status()}")
 
-    def _block_until_midnight(self) -> None:
+    def _daily_status(self) -> str:
+        now = time.time()
+        parts = [f"{p.name} resets in {self._fmt_wait(self._daily_block[p.name] - now)}" for p in self._providers if self._daily_block.get(p.name, 0) > now]
+        return "; ".join(parts)
+
+    @staticmethod
+    def _midnight_utc() -> float:
         now = dt.datetime.now(dt.timezone.utc)
         tomorrow = (now + dt.timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
-        self._daily_block_until = tomorrow.timestamp()
+        return tomorrow.timestamp()
 
     @staticmethod
     def _fmt_wait(seconds: float) -> str:
         h, m = divmod(int(max(seconds, 0)) // 60, 60)
         return f"{h}h {m}m" if h else f"{m}m"
 
-    # ----------------------------------------------------- free-model discovery
+    # ----------------------------------------------------- free-model discovery (OpenRouter only)
 
     def _maybe_refresh_models(self, max_age: float = 6 * 3600) -> None:
-        if "auto" not in self._configured or time.time() - self._discovered_at < max_age:
+        p = next((p for p in self._providers if p.name == "openrouter"), None)
+        if p is None or "auto" not in p.models or time.time() - self._discovered_at < max_age:
             return
         self._discovered_at = time.time()  # set first: a failure shouldn't retry on every call
         try:

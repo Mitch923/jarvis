@@ -49,11 +49,11 @@ async def main():
     ok("!help / !stop / !status")
 
     # DM task, full flow
-    fake_llm.SCRIPT[:] = [("tool", "pi_status", {}), ("tool", "final_answer", {"answer": "Pi is fine 🌡️"})]
-    ch = FakeChannel(1); m = user_msg("how's the pi?", ch=ch)
+    fake_llm.SCRIPT[:] = [("tool", "jarvis_status", {}), ("tool", "final_answer", {"answer": "Server is fine 🌡️"})]
+    ch = FakeChannel(1); m = user_msg("how's the server?", ch=ch)
     await bot.on_message(m)
-    assert m.replies and m.replies[0].startswith("Pi is fine"), m.replies
-    assert "m1 · 2 step(s)" in m.replies[0]
+    assert m.replies and m.replies[0].startswith("Server is fine"), m.replies
+    assert "openrouter:m1 · 2 step(s)" in m.replies[0]
     assert ch.sent and ch.sent[0].deleted, "status message should be removed"
     ok("DM task -> reply with footer; status message cleaned up: " + repr(m.replies[0]))
 
@@ -61,7 +61,7 @@ async def main():
     fake_llm.SEEN.clear(); fake_llm.SCRIPT[:] = [("text", "second")]
     await bot.on_message(user_msg("and now?", ch=ch))
     assert len(bot.history[1]) == 2
-    assert "Earlier in this conversation" in bot._prompt(1, "x") and "how's the pi?" in bot._prompt(1, "x")
+    assert "Earlier in this conversation" in bot._prompt(1, "x") and "how's the server?" in bot._prompt(1, "x")
     await bot.on_message(user_msg("!reset", ch=ch)); assert 1 not in bot.history and bot._prompt(1, "x") == "x"
     ok("per-channel history kept, then cleared by !reset")
 

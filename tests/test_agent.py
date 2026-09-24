@@ -18,10 +18,10 @@ def reset(): fake_llm.SEEN.clear(); fake_llm.SCRIPT.clear(); steps_seen.clear()
 
 async def scenario():
     # 1. tool call then final_answer
-    reset(); fake_llm.SCRIPT[:] = [("tool", "pi_status", {}), ("tool", "final_answer", {"answer": "All good"})]
-    r = await runner.run("how is the pi?", cb)
-    assert r.text == "All good" and r.steps == 2 and r.model == "m1", r
-    assert steps_seen == [(1, ["pi_status"]), (2, ["final_answer"])], steps_seen
+    reset(); fake_llm.SCRIPT[:] = [("tool", "jarvis_status", {}), ("tool", "final_answer", {"answer": "All good"})]
+    r = await runner.run("how is the server?", cb)
+    assert r.text == "All good" and r.steps == 2 and r.model == "openrouter:m1", r
+    assert steps_seen == [(1, ["jarvis_status"]), (2, ["final_answer"])], steps_seen
     ok(f"tool step + final_answer  -> {r}")
 
     # 2. plain prose answer becomes the final answer in ONE step
@@ -39,7 +39,7 @@ async def scenario():
     reset(); fake_llm.SCRIPT[:] = [("429_day",)]
     try: await runner.run("hi", cb); assert False
     except LLMQuotaError as e: ok("quota -> " + M.explain_error(e, cfg))
-    runner.model._daily_block_until = 0
+    runner.model._daily_block.clear()
 
     # 5. !stop during a long rate-limit wait
     reset(); fake_llm.SCRIPT[:] = [("429_minute", 25)]
@@ -57,7 +57,7 @@ async def scenario():
     except M.RunTimeout: ok(f"run timeout after {time.time()-t:.1f}s -> {M.explain_error(M.RunTimeout(), cfg)}")
 
     # 7. max steps: model keeps calling tools forever
-    reset(); fake_llm.SCRIPT[:] = [("tool", "pi_status", {})] * 3 + [("text", "Best summary I could do")]
+    reset(); fake_llm.SCRIPT[:] = [("tool", "jarvis_status", {})] * 3 + [("text", "Best summary I could do")]
     r = await runner.run("loop", cb); ok(f"max_steps reached -> graceful final answer: {r.text!r} ({r.steps} steps)")
 
     # 8. tool error string doesn't crash the run; unknown tool -> error fed back, run continues

@@ -1,6 +1,7 @@
 """Minimal GitHub REST client (requests only) shared by the tools and the watcher."""
 import base64
 import logging
+import os
 import re
 import time
 from typing import Optional
@@ -13,6 +14,19 @@ from urllib3.util.retry import Retry
 from config import Config
 
 log = logging.getLogger("github")
+
+
+def git_auth_env(token: str, url: str) -> dict:
+    """Env vars that make `git` send `token` as a GitHub HTTPS Basic-auth header, but only for
+    an https://github.com/... URL - via GIT_CONFIG_* rather than the URL or argv, so the token
+    is never written into .git/config, shown in `ps`, or logged in shell history. Shared by
+    updater.py (updating this checkout) and checkouts.py (cloning/syncing other repos)."""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    if token and url.startswith("https://github.com/"):
+        basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="http.https://github.com/.extraheader", GIT_CONFIG_VALUE_0=f"AUTHORIZATION: basic {basic}")
+    return env
+
 
 def clip(text: str, limit: int) -> str:
     if len(text) <= limit:
@@ -40,7 +54,7 @@ class GitHub:
             {
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": "pi-agent",
+                "User-Agent": "jarvis",
             }
         )
         if cfg.github_token:

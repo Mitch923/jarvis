@@ -24,6 +24,8 @@ def make(protected="", approval="publish", self_repo="me/proj"):
 # ---- protected_reason unit checks
 cfg, _ = make()
 assert T.protected_reason(cfg, "tools.py", exists=True)
+assert T.protected_reason(cfg, "checkouts.py", exists=True)
+assert T.protected_reason(cfg, "sandbox.py", exists=True)
 assert T.protected_reason(cfg, "main.py", exists=True)
 assert T.protected_reason(cfg, ".github/workflows/ci.yml", exists=True)
 assert T.protected_reason(cfg, "requirements-dev.txt", exists=True)

@@ -3,3 +3,7 @@ smolagents[openai]>=1.26,<2   # pulls openai, requests, rich, jinja2, pillow, py
 discord.py>=2.4,<3
 ddgs>=9,<10                   # DuckDuckGo search, no API key
 markdownify>=1.0              # HTML -> Markdown for visit_webpage
+
+# Not on PyPI - install with your system package manager:
+#   git     required: !update, and if CHECKOUTS_ENABLED=1 (repo_sync/repo_read/repo_grep/repo_test)
+#   docker  optional: only for repo_test (SANDBOX_RUNTIME=docker, the default - podman also works)

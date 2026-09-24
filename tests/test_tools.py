@@ -52,7 +52,7 @@ ok("second edit + new file on existing branch")
 
 r = tl["gh_open_pr"](repo="proj", title="Fix typo", body="Fixes a typo", head="agent/fix")
 assert "Opened PR #7" in r, r; assert asked and asked[0][0] == "Open a pull request"; print(asked[0][1])
-assert "Opened by pi-agent" in fake_gh.STATE["prs"][0]["body"]
+assert "Opened by jarvis" in fake_gh.STATE["prs"][0]["body"]
 ok("PR opened after approval, footer added")
 
 asked.clear(); answer["v"] = False
@@ -85,7 +85,7 @@ ok("allowlist enforced")
 
 # --- no token -> no github tools
 os.environ["GITHUB_TOKEN"] = ""; tl = {t.name for t in T.build_tools(Config.from_env(), approve)}
-assert tl == {"web_search", "visit_webpage", "pi_status"}, tl
+assert tl == {"web_search", "visit_webpage", "jarvis_status"}, tl
 ok("no token -> only web + status tools")
 
 # --- web safety
@@ -110,4 +110,4 @@ T._check_public_url = orig
 assert "# Title" in txt and "**world**" in txt and "evil()" not in txt and "menu" not in txt and "truncated" in txt and len(txt) < 2200, txt[:300]
 ok("HTML -> markdown, scripts/nav stripped, redirect followed, truncated")
 
-print(tl["pi_status"]())
+print(tl["jarvis_status"]())

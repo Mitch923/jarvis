@@ -1,4 +1,4 @@
-"""Agent tools: GitHub (read + guarded write), web search/fetch, Raspberry Pi status.
+"""Agent tools: GitHub (read + guarded write), web search/fetch, server status.
 
 Design rules baked in here (so a confused or prompt-injected model can't break them):
   * The agent can NEVER push to a normal branch. Writes only go to branches that start
@@ -30,9 +30,11 @@ from zoneinfo import ZoneInfo
 import requests
 from smolagents import tool
 
+from checkouts import Checkouts
 from config import Config
 from ghclient import GitHub, GitHubError, clip
 from memory import Memory, NoteRefused
+from sandbox import run_tests as run_sandboxed_tests
 from watcher import overview
 
 log = logging.getLogger("tools")
@@ -94,8 +96,8 @@ def make_safe(record: Optional[Callable[..., None]] = None):
 # safety logic (branch guard, allowlists, approvals, mention limits), the launcher/updater and
 # the CI that judges its own pull requests. A human makes those changes. PROTECTED_PATHS adds more.
 LOCKED_PATHS = (
-    "tools.py", "config.py", "main.py", "ghclient.py", "run.py", "updater.py",
-    "pi-agent.service", "requirements*.txt", ".github/*",
+    "tools.py", "config.py", "main.py", "ghclient.py", "checkouts.py", "sandbox.py", "run.py", "updater.py",
+    "jarvis.service", "requirements*.txt", ".github/*",
 )  # fmt: skip
 LOCKED_EXISTING = ("tests/*",)  # existing tests can't be edited or deleted (new test files are fine)
 
@@ -117,11 +119,11 @@ def protected_reason(cfg: Config, path: str, exists: bool) -> Optional[str]:
     return None
 
 
-# ═══════════════════════════════════════════════════════════════ Pi / system
+# ═══════════════════════════════════════════════════════════════ Server / system
 
 
 def system_report(tz_name: str = "UTC") -> str:
-    """Time + Raspberry Pi health, using only /proc and /sys (no extra dependencies)."""
+    """Time + server health, using only /proc and /sys (no extra dependencies)."""
     try:
         tz = ZoneInfo(tz_name)
     except Exception:  # noqa: BLE001
@@ -194,7 +196,7 @@ def fetch_page_text(url: str, limit: int) -> str:
             timeout=(5, 15),
             stream=True,
             allow_redirects=False,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; pi-agent)"},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; jarvis)"},
         )
         if 300 <= r.status_code < 400 and r.headers.get("location"):
             url = urljoin(url, r.headers["location"])
@@ -296,11 +298,11 @@ def build_tools(
 
     @tool
     @_safe
-    def pi_status() -> str:
-        """Current date/time and Raspberry Pi health: CPU temperature, load, memory, disk, uptime."""
+    def jarvis_status() -> str:
+        """Current date/time and server health: CPU temperature, load, memory, disk, uptime."""
         return system_report(cfg.timezone)
 
-    tools += [web_search, visit_webpage, pi_status]
+    tools += [web_search, visit_webpage, jarvis_status]
 
     if memory is not None:
 
@@ -573,6 +575,72 @@ def build_tools(
 
     tools += [gh_repos, gh_browse, gh_search_code, gh_commits, gh_diff, gh_prs, gh_pr, gh_issues, gh_issue, gh_ci, gh_overview]
 
+    # ------------------------------------------------------------ local checkouts + sandboxed tests
+
+    if cfg.checkouts_enabled:
+        checkouts = Checkouts(cfg)
+
+        @tool
+        @_safe
+        def repo_sync(repo: str, ref: Optional[str] = None) -> str:
+            """Clone or update a local checkout of a repo, so repo_read/repo_grep/repo_test have something to work with. Not required first - they sync automatically - but useful to pre-fetch or to switch which branch is checked out.
+
+            Args:
+                repo: 'owner/name' or just 'name'.
+                ref: Branch, tag or commit SHA. Defaults to the default branch.
+            """
+            slug = gh.slug(repo)  # single source of truth for name/owner resolution and the allowlist
+            local, sha = checkouts.sync(slug, ref)
+            return f"{slug} synced @ {sha}" + (f" (ref: {ref})" if ref else " (default branch)") + f" -> {local}"
+
+        @tool
+        @_safe
+        def repo_read(repo: str, path: str = "", start_line: int = 1, max_lines: int = 400) -> str:
+            """List a directory or read a file (with line numbers) from a LOCAL checkout - faster than gh_browse and not paginated the same way. Syncs the repo first if needed.
+
+            Args:
+                repo: 'owner/name' or just 'name'.
+                path: Path inside the repo; empty for the root directory.
+                start_line: First line to show when reading a file (1-based).
+                max_lines: Max lines to show when reading a file.
+            """
+            slug = gh.slug(repo)
+            return untrusted(clip(checkouts.read(slug, path, start_line, max_lines), limit_chars))
+
+        @tool
+        @_safe
+        def repo_grep(repo: str, pattern: str, path_glob: str = "") -> str:
+            """Full-text regex search across a whole local checkout - use this instead of gh_search_code when you need every match, not just GitHub's indexed results. Syncs the repo first if needed.
+
+            Args:
+                repo: 'owner/name' or just 'name'.
+                pattern: Regular expression to search for (e.g. 'def parse_config\\(').
+                path_glob: Optional glob to restrict the search, e.g. '*.py' or 'src/*'.
+            """
+            slug = gh.slug(repo)
+            return untrusted(clip(checkouts.grep(slug, pattern, path_glob), limit_chars))
+
+        tools += [repo_sync, repo_read, repo_grep]
+
+        if cfg.sandbox_runtime:
+
+            @tool
+            @_safe
+            def repo_test(repo: str, ref: Optional[str] = None) -> str:
+                """Run the repo's own test suite in an isolated, network-limited container. Use this to check an edit BEFORE opening a pull request - pass the branch you just committed to as ref. Auto-detects the test command from common project files; falls back to a TEST_COMMANDS entry if configured.
+
+                Args:
+                    repo: 'owner/name' or just 'name'.
+                    ref: Branch, tag or commit SHA to test. Defaults to the default branch.
+                """
+                slug = gh.slug(repo)
+                local, sha = checkouts.sync(slug, ref)
+                result = run_sandboxed_tests(cfg, slug, local)
+                verdict = "TIMED OUT" if result.timed_out else "PASSED" if result.ok else "FAILED"
+                return untrusted(clip(f"{slug} @ {sha} - tests {verdict} ({result.seconds:.0f}s, image {result.image})\n$ {result.command}\n{result.output}", limit_chars))
+
+            tools += [repo_test]
+
     # ------------------------------------------------------------ GitHub (write)
 
     if not cfg.github_write:
@@ -669,7 +737,7 @@ def build_tools(
                     raise Locked(f"This branch changes a locked file, so I can't open a PR for it. {reason}")
         files = "\n".join(f"  {f['filename']} +{f['additions']} -{f['deletions']}" for f in cmp["files"][:15])
         draft = bool(cfg.self_repo and slug == cfg.self_repo)  # changes to the bot itself always start as drafts
-        body = clip(body, 3000) + "\n\n---\n_Opened by pi-agent (LLM-written). Please review before merging._"
+        body = clip(body, 3000) + "\n\n---\n_Opened by jarvis (LLM-written). Please review before merging._"
         if needs_approval("publish"):
             detail = f"`{slug}`: `{head}` -> `{base}`{' (DRAFT: changes to me)' if draft else ''}\n**{title[:120]}**\n```\n{files}\n```\n{clip(body, 500)}"
             if not approve("Open a pull request", detail):
@@ -688,7 +756,7 @@ def build_tools(
             body: The review text (Markdown).
         """
         slug = gh.slug(repo)
-        body = clip(body, 6000) + "\n\n_Automated review by pi-agent._"
+        body = clip(body, 6000) + "\n\n_Automated review by jarvis._"
         if needs_approval("publish"):
             if not approve("Post a PR review", f"`{slug}` #{int(number)}\n{clip(body, 1200)}"):
                 return denied

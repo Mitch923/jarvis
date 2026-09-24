@@ -1,5 +1,11 @@
 # sudo cp jarvis.service /etc/systemd/system/ && sudo systemctl enable --now jarvis
 # Logs: journalctl -u jarvis -f
+#
+# If you use repo_test (sandboxed tests via Docker/Podman), the service's User needs access to
+# the container runtime. For Docker that normally means adding the user to the `docker` group -
+# be aware that's equivalent to root on this machine (anyone in that group can bind-mount the
+# host's root filesystem into a container). Rootless Docker, or Podman (SANDBOX_RUNTIME=podman,
+# which supports fully rootless use), avoids that trade-off; prefer one of those if you can.
 [Unit]
 Description=Discord AI agent (smolagents)
 After=network-online.target
@@ -9,16 +15,20 @@ Wants=network-online.target
 Type=simple
 User=mitch
 WorkingDirectory=/home/mitch/jarvis
-ExecStart=/home/mitch/jarvis/.venv/bin/python main.py
+ExecStart=/home/mitch/jarvis/.venv/bin/python run.py
 Restart=always
 RestartSec=10
 Nice=5
-# The Pi has 1 GB: if the agent ever balloons, restart it instead of letting the whole board thrash.
-MemoryMax=600M
+# Sized for the current server build. Lower it if the box has less RAM, raise it if it has more
+# (a runaway single run should never take down the whole machine). (Containers repo_test spawns
+# are NOT counted against this: they're managed by the separate Docker/Podman daemon, with its
+# own SANDBOX_MEMORY cap.)
+MemoryMax=3G
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
+# If you set CHECKOUT_DIR or DATA_DIR outside the working directory, add that path here too.
 ReadWritePaths=/home/mitch/jarvis
 
 [Install]
