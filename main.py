@@ -716,10 +716,21 @@ class Bot(discord.Client):
         total = self.cfg.max_steps
 
         def on_step(step: ActionStep, agent=None):  # runs in the agent thread
-            names = [tc.name for tc in (step.tool_calls or []) if tc.name != "final_answer"]
-            what = ", ".join(f"`{n}`" for n in names) or "thinking"
-            if step.error:
-                what += " ⚠️"
+            if step.is_final_answer:
+                what = "✅ done"
+            elif step.tool_calls:
+                names = [tc.name for tc in step.tool_calls if tc.name != "final_answer"]
+                what = ", ".join(f"`{n}`" for n in names) or "tool call"
+                if step.error:  # a tool actually failed — not just a thinking step
+                    what += " ⚠️"
+            else:
+                # no tool call, not the final step -> the model produced prose
+                # (a "thinking" step the agent re-prompts on; not a failure).
+                prose = step.model_output
+                if not isinstance(prose, str):
+                    prose = ""
+                snippet = " ".join(prose.split())[:140]
+                what = "🧠 thinking…" + (f" ({snippet}…)" if snippet else "")
             log.info("step %s/%s: %s", step.step_number, total, what)
             now = time.monotonic()
             if now - last["t"] >= 2.0:  # stay well under Discord's edit rate limit

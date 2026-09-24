@@ -142,7 +142,7 @@ async def main():
     a = bot.runner.make_agent(lambda *a, **k: None); assert "I like concise answers" not in a.system_prompt
     m = user_msg("!remember my key is ghp_abcdefghijklmnop1234"); await bot.on_message(m); assert "secret" in m.replies[0]
     ok("!remember/!memory/!forget; notes injected into the agent's system prompt and removed again")
-    m = user_msg("!unknowncmd hello"); fake_llm.SCRIPT[:] = [("text", "went to the agent")]; await bot.on_message(m); assert m.replies[0].startswith("went to the agent")
+    m = user_msg("!unknowncmd hello"); fake_llm.SCRIPT[:] = [("tool", "final_answer", {"answer": "went to the agent"})]; await bot.on_message(m); assert m.replies[0].startswith("went to the agent")
     ok("unknown !command falls through to the agent")
     # digest command
     m = user_msg("!digest"); await bot.on_message(m); assert "Repo digest" in m.replies[0]

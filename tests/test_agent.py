@@ -24,10 +24,17 @@ async def scenario():
     assert steps_seen == [(1, ["jarvis_status"]), (2, ["final_answer"])], steps_seen
     ok(f"tool step + final_answer  -> {r}")
 
-    # 2. plain prose answer becomes the final answer in ONE step
-    reset(); fake_llm.SCRIPT[:] = [("text", "Hello there!")]
-    r = await runner.run("hi", cb); assert r.text == "Hello there!" and r.steps == 1
-    ok("prose answer accepted as final answer")
+    # 2. plain prose is a THINKING step (not a final answer): the run keeps going,
+    # picks up a tool call, then lands on final_answer
+    reset(); fake_llm.SCRIPT[:] = [
+        ("text", "I should check the status first"),  # thinking step, NOT a final answer
+        ("tool", "jarvis_status", {}),
+        ("tool", "final_answer", {"answer": "Server is healthy"}),
+    ]
+    r = await runner.run("hi", cb)
+    assert r.text == "Server is healthy" and r.steps == 3
+    assert steps_seen == [(1, []), (2, ["jarvis_status"]), (3, ["final_answer"])], steps_seen
+    ok(f"prose thinking step -> tool -> final_answer (steps={r.steps}, text={r.text!r})")
 
     # 3. LLM totally down -> clean LLMUnavailableError, not a generic crash
     reset(); fake_llm.SCRIPT[:] = [("status", 500)] * 6

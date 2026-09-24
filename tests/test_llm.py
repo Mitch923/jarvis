@@ -105,7 +105,7 @@ assert time.time() - t < 4
 ok("per-call deadline respected")
 os.environ["LLM_CALL_DEADLINE"] = "25"
 
-# 15. tool calling: native tool call, prose -> final_answer, JSON-in-text -> tool call
+# 15. tool calling: native, prose->thinking (not final), cap, streak reset, JSON-in-text
 from smolagents import tool
 @tool
 def jarvis_status() -> str:
@@ -129,15 +129,31 @@ assert fake_llm.SEEN[0][1] is True and fake_llm.SEEN[0][2] == "auto" and fake_ll
 ok("native tool call passes through; tool_choice=auto; no stop param")
 m = new(); fake_llm.SCRIPT[:] = [("text", "Just prose answer")]
 r = m.generate(msgs, tools_to_call_from=tools)
-assert r.tool_calls[0].function.name == "final_answer" and r.tool_calls[0].function.arguments == {"answer": "Just prose answer"}
-ok("prose reply converted to final_answer")
+assert r.tool_calls in (None, []) and r.content == "Just prose answer" and m._prose_count == 1
+ok("first prose reply is a thinking step (no tool call, not final)")
+m = new(); fake_llm.SCRIPT[:] = [("text", "thinking")]
+m.generate(msgs, tools_to_call_from=tools)
+fake_llm.SCRIPT[:] = [("tool", "jarvis_status", {})]
+r = m.generate(msgs, tools_to_call_from=tools)
+assert r.tool_calls[0].function.name == "jarvis_status" and m._prose_count == 0
+ok("tool call after thinking resets the streak")
+m = new()
+for i in range(m._PROSE_LIMIT):
+    fake_llm.SCRIPT[:] = [("text", f"thinking {i}")]
+    r = m.generate(msgs, tools_to_call_from=tools)
+    if i < m._PROSE_LIMIT - 1:
+        assert r.tool_calls in (None, [])
+    else:
+        assert r.tool_calls[0].function.name == "final_answer"
+        assert r.tool_calls[0].function.arguments == {"answer": f"thinking {i}"}
+ok(f"consecutive prose x{m._PROSE_LIMIT} -> final_answer (last-resort cap)")
 m = new(); fake_llm.SCRIPT[:] = [("json_text", "jarvis_status", {})]
 r = m.generate(msgs, tools_to_call_from=tools)
 assert r.tool_calls[0].function.name == "jarvis_status"
 ok("JSON-in-text tool call recovered")
 m = new(); fake_llm.SCRIPT[:] = [("json_text", "nonexistent_tool", {})]
 r = m.generate(msgs, tools_to_call_from=tools)
-assert r.tool_calls[0].function.name == "final_answer"
-ok("unknown tool name in text -> treated as prose")
+assert r.tool_calls in (None, []) and r.content and m._prose_count == 1
+ok("unknown tool name in text -> thinking step (not a tool call)")
 
 print(new().describe())

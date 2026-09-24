@@ -159,6 +159,8 @@ class ResilientModel(OpenAIServerModel):
         self.requests_today = 0
         self.failures_today = 0
         self.last_error = ""
+        self._prose_count = 0  # consecutive prose-only replies ("thinking" streak) in this run
+        self._PROSE_LIMIT = 3  # after this many, force a final_answer (last resort)
         self.abort = threading.Event()
         self.on_event = None  # optional callable(kind, model=..., detail=...) for the friction log
 
@@ -202,6 +204,7 @@ class ResilientModel(OpenAIServerModel):
 
     def begin_run(self) -> None:
         self.abort.clear()
+        self._prose_count = 0  # fresh run -> fresh thinking streak
 
     def stop(self) -> None:
         self.abort.set()
@@ -323,28 +326,48 @@ class ResilientModel(OpenAIServerModel):
             else None,
         )
         self.model_id = f"{provider}:{model_id}"  # so agent logs and the friction log show which model answered
-        if tools and not out.tool_calls:
-            out = self._prose_to_tool_call(out, tools)
+        if out.tool_calls:
+            self._prose_count = 0  # a real tool call ends any thinking streak
+        elif tools and out.content and out.content.strip():
+            out = self._handle_prose(out, tools)
         return out
 
-    def _prose_to_tool_call(self, msg: ChatMessage, tools: list) -> ChatMessage:
+    def _handle_prose(self, msg: ChatMessage, tools: list) -> ChatMessage:
+        """Resolve a prose-only reply while tool calling is enabled.
+
+        Returns either a real tool call (the prose encoded a known tool, or a
+        forced final_answer as a last resort) or the prose itself -- a "thinking"
+        step that the agent re-prompts on. A short streak of consecutive prose
+        replies prevents the run from stalling forever without a tool call.
+        """
         names = {t.name for t in tools}
         try:  # some models print the call as JSON text instead of using the tool API
             parsed = self.parse_tool_calls(msg)
             if parsed.tool_calls and parsed.tool_calls[0].function.name in names:
+                self._prose_count = 0  # a real (in-prose) tool call resets the streak
                 return parsed
         except Exception:  # noqa: BLE001
             pass
         msg.tool_calls = None
-        if "final_answer" in names and msg.content:
-            self._emit("prose_final", self.model_id, "model answered in prose instead of calling a tool")
+        if (
+            "final_answer" in names
+            and self._prose_count + 1 >= self._PROSE_LIMIT
+            and msg.content and msg.content.strip()
+        ):
+            # last resort: the model has been talking in prose the whole time.
+            self._prose_count = self._PROSE_LIMIT
+            self._emit("prose_final", self.model_id,
+                       f"consecutive prose replies {self._PROSE_LIMIT}; forcing final_answer")
             msg.tool_calls = [
                 ChatMessageToolCall(
                     id=f"call_{uuid.uuid4().hex[:12]}",
                     type="function",
-                    function=ChatMessageToolCallFunction(name="final_answer", arguments={"answer": msg.content.strip()}),
+                    function=ChatMessageToolCallFunction(
+                        name="final_answer", arguments={"answer": msg.content.strip()}),
                 )
             ]
+        else:
+            self._prose_count += 1  # thinking step; the agent re-prompts on the next loop
         return msg
 
     def _emit(self, kind: str, model: str, detail: str) -> None:

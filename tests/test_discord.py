@@ -66,9 +66,10 @@ async def main():
     ok("per-channel history kept, then cleared by !reset")
 
     # @mention in a guild works; dedicated channel works without mention
-    fake_llm.SCRIPT[:] = [("text", "mention ok")]
+    # (prose is now a thinking step, so the final answer must come from a final_answer tool call)
+    fake_llm.SCRIPT[:] = [("tool", "final_answer", {"answer": "mention ok"})]
     m = user_msg(f"<@999> hi there", guild=object(), mentions=[me]); await bot.on_message(m); assert m.replies[0].startswith("mention ok")
-    fake_llm.SCRIPT[:] = [("text", "channel ok")]
+    fake_llm.SCRIPT[:] = [("tool", "final_answer", {"answer": "channel ok"})]
     m = user_msg("hi", guild=object(), ch=FakeChannel(555)); await bot.on_message(m); assert m.replies[0].startswith("channel ok")
     ok("@mention and dedicated-channel triggers")
 
