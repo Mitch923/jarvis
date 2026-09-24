@@ -23,7 +23,7 @@ def make(protected="", approval="publish", self_repo="me/proj"):
 
 # ---- protected_reason unit checks
 cfg, _ = make()
-assert T.protected_reason(cfg, "tools.py", exists=True)
+assert T.protected_reason(cfg, "tools/github_write.py", exists=True)
 assert T.protected_reason(cfg, "checkouts.py", exists=True)
 assert T.protected_reason(cfg, "sandbox.py", exists=True)
 assert T.protected_reason(cfg, "main.py", exists=True)
@@ -31,7 +31,7 @@ assert T.protected_reason(cfg, ".github/workflows/ci.yml", exists=True)
 assert T.protected_reason(cfg, "requirements-dev.txt", exists=True)
 assert T.protected_reason(cfg, "tests/test_llm.py", exists=True)
 assert T.protected_reason(cfg, "tests/test_llm.py", exists=False) is None  # a NEW test file is fine
-assert T.protected_reason(cfg, "TOOLS.PY", exists=True), "match should be case-insensitive"
+assert T.protected_reason(cfg, "TOOLS/GITHUB_WRITE.PY", exists=True), "match should be case-insensitive"
 assert T.protected_reason(cfg, "../../etc/passwd", exists=False)
 assert T.protected_reason(cfg, "watcher.py", exists=True) is None
 assert T.protected_reason(cfg, "README.md", exists=True) is None
@@ -44,7 +44,8 @@ ok("PROTECTED_PATHS: extra user-configured globs enforced")
 
 # ---- gh_edit_file / gh_write_file refuse locked files, only on SELF_REPO
 cfg, tl = make()
-r = tl["gh_edit_file"](repo="proj", path="tools.py", old_text="import", new_text="import os", branch="agent/x", commit_message="m")
+fake_gh.STATE["files"]["main"]["tools/github_write.py"] = "print('hi')\n"
+r = tl["gh_edit_file"](repo="proj", path="tools/github_write.py", old_text="hi", new_text="bye", branch="agent/x", commit_message="m")
 assert r.startswith("ERROR:") and "locked" in r and not asked
 r = tl["gh_write_file"](repo="proj", path="config.py", content="x", branch="agent/x", commit_message="m")
 assert r.startswith("ERROR:") and "locked" in r
@@ -55,8 +56,8 @@ ok("gh_edit_file/gh_write_file refuse locked files on the self-repo, allow other
 # a repo that ISN'T the self-repo has no locked files at all
 os.environ["GITHUB_ALLOWED_REPOS"] = "me/proj,me/other"
 cfg, tl = make(self_repo="me/other")
-fake_gh.STATE["files"]["main"]["tools.py"] = "print('hi')\n"  # this repo's own tools.py, unrelated to the bot's code
-r = tl["gh_edit_file"](repo="proj", path="tools.py", old_text="hi", new_text="bye", branch="agent/x", commit_message="m")
+fake_gh.STATE["files"]["main"]["tools/github_write.py"] = "print('hi')\n"  # this repo's own tools/github_write.py, unrelated to the bot's code
+r = tl["gh_edit_file"](repo="proj", path="tools/github_write.py", old_text="hi", new_text="bye", branch="agent/x", commit_message="m")
 assert r.startswith("Committed"), r
 os.environ["GITHUB_ALLOWED_REPOS"] = "me/proj"
 ok("locked-file guard only applies to SELF_REPO, not other repos")
@@ -73,7 +74,7 @@ ok("gh_open_pr: PRs on the self-repo are forced to draft, flagged in the approva
 
 # branch touches a locked file even though gh_edit_file was bypassed (simulate direct API tampering)
 fake_gh.STATE["files"]["agent/sneaky"] = dict(fake_gh.STATE["files"]["main"]); fake_gh.STATE["branches"]["agent/sneaky"] = "sha-x"
-fake_gh.STATE["files"]["agent/sneaky"]["tools.py"] = "TAMPERED\n"
+fake_gh.STATE["files"]["agent/sneaky"]["tools/github_write.py"] = "TAMPERED\n"
 r = tl["gh_open_pr"](repo="proj", title="sneaky", body="x", head="agent/sneaky")
 assert r.startswith("ERROR:") and "locked" in r and not fake_gh.STATE["prs"][-1].get("title") == "sneaky"
 ok("gh_open_pr: refuses to open a PR whose diff touches a locked file, even if committed another way")

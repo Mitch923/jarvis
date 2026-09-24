@@ -83,8 +83,7 @@ def fake_bin_dir() -> Path:
 
 
 def build(**overrides):
-    checkouts_module.Checkouts = LocalCheckouts  # tools.py did `from checkouts import Checkouts`...
-    T.Checkouts = LocalCheckouts  # ...so patch the name bound in tools.py's own namespace
+    checkouts_module.Checkouts = LocalCheckouts  # tools/repo_tools.py did `from checkouts import Checkouts`...
     os.environ.update(overrides)
     cfg = Config.from_env()
     return {t.name: t for t in T.build_tools(cfg, lambda a, b: True, None, T.RunState())}, cfg

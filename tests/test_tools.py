@@ -104,9 +104,9 @@ class P(BaseHTTPRequestHandler):
         html = b"<html><head><style>x{}</style><script>evil()</script></head><body><nav>menu</nav><h1>Title</h1><p>Hello <b>world</b></p>" + b"<p>filler</p>" * 5000 + b"</body></html>"
         self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.end_headers(); self.wfile.write(html)
 s2 = HTTPServer(("127.0.0.1", 0), P); threading.Thread(target=s2.serve_forever, daemon=True).start()
-orig = T._check_public_url; T._check_public_url = lambda url: None
-txt = T.fetch_page_text(f"http://127.0.0.1:{s2.server_address[1]}/redir", 2000)
-T._check_public_url = orig
+orig = T.web._check_public_url; T.web._check_public_url = lambda url: None
+txt = T.web.fetch_page_text(f"http://127.0.0.1:{s2.server_address[1]}/redir", 2000)
+T.web._check_public_url = orig
 assert "# Title" in txt and "**world**" in txt and "evil()" not in txt and "menu" not in txt and "truncated" in txt and len(txt) < 2200, txt[:300]
 ok("HTML -> markdown, scripts/nav stripped, redirect followed, truncated")
 

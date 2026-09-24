@@ -1,0 +1,3 @@
+# Long-term memory
+
+Short notes in `data/memory.json` (plain JSON, max `MEMORY_MAX_NOTES`, 300 chars each) are added to the agent's prompt in every chat. Save with `!remember`, or just tell the agent "remember that…". Secret-looking strings (API keys) are refused. **If a task has already read web or GitHub content, the agent must ask you (✅/✖️) before saving or deleting a note**, so a malicious page can't plant a permanent instruction.
