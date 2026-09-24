@@ -1,4 +1,4 @@
-import json, os, stat, subprocess, sys, tempfile, time
+import json, os, shutil, stat, subprocess, sys, tempfile, time
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 from pathlib import Path
 
@@ -153,9 +153,17 @@ finally:
 assert not r.startswith("ERROR:") and "tests FAILED" in r and "1 failed" in r
 ok("repo_test: a real test failure is reported in the text, not treated as a tool error")
 
-# 6. repo_test: docker missing (but git still available) -> a clean ERROR string, not a crash
-git_dir = os.path.dirname(subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip())
-os.environ["PATH"] = git_dir  # git available, but no docker/podman anywhere on PATH
+# 6. repo_test: docker missing (but git still available) -> a clean ERROR string, not a crash.
+# Build a private bin dir containing ONLY git (no docker/podman). Narrowing PATH to the git
+# directory (the old approach) is not enough on runners that ship docker in /usr/bin; a
+# self-contained dir guarantees the restricted PATH is what the check intends.
+git_src_str = subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip()
+if not git_src_str:
+    raise AssertionError("git not found on PATH")
+git_only_bin = Path(tempfile.mkdtemp())
+shutil.copy2(Path(git_src_str), git_only_bin / "git")
+(git_only_bin / "git").chmod(stat.S_IEXEC)
+os.environ["PATH"] = str(git_only_bin)  # git available, but no docker/podman on PATH
 try:
     r = tl["repo_test"](repo="proj")
 finally:
