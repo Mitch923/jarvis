@@ -13,9 +13,11 @@ Security posture, honestly stated:
     install`/build artifacts have somewhere to go) but NOTHING else on the host. That checkout is
     a disposable mirror - checkouts.py hard-resets and cleans it on every future sync - so anything
     written there is expected to vanish before it's used again, not something worth protecting.
-  * network access is ON by default (SANDBOX_NETWORK=bridge), because most real projects need it
-    to install dependencies. Set SANDBOX_NETWORK=none to fully air-gap a repo with vendored or no
-    dependencies. Either way the container has no secrets worth exfiltrating.
+  * network access is OFF by default (SANDBOX_NETWORK=none). Only repos explicitly listed in
+    SANDBOX_NETWORK_ALLOWED_REPOS may use the configured network mode (bridge or none). This is
+    a default-deny posture: most projects don't need network access during test runs if they
+    vendor dependencies or have none; those that do (e.g. need to install from PyPI/npm) must be
+    explicitly opted in. Either way the container has no secrets worth exfiltrating.
   * NOT included: a read-only root filesystem. That would break ordinary system-wide `pip
     install`/`npm install` (they write under /usr or /root), and reaching that level of isolation
     properly (a venv, a locked-down image per language) was judged not worth the complexity for a
@@ -122,12 +124,22 @@ def run_tests(cfg: Config, repo_slug: str, local: Path) -> SandboxResult:
     image, command = resolve_command(cfg, repo_slug, local)
     name = f"jarvis-test-{uuid.uuid4().hex[:12]}"
 
+    # Network mode: default-deny. Only repos in SANDBOX_NETWORK_ALLOWED_REPOS get the configured network (bridge/none).
+    # All other repos are forced to "none" (air-gapped).
+    repo_slug_lower = repo_slug.lower()
+    if repo_slug_lower in cfg.sandbox_network_allowed_repos:
+        network_mode = cfg.sandbox_network
+        log.info("sandbox: %s network allowed (config=%s)", repo_slug, network_mode)
+    else:
+        network_mode = "none"
+        log.info("sandbox: %s network denied (default-deny, not in SANDBOX_NETWORK_ALLOWED_REPOS)", repo_slug)
+
     args = [
         runtime, "run", "--rm", "--name", name,
         "--memory", cfg.sandbox_memory,
         "--cpus", cfg.sandbox_cpus,
         "--pids-limit", "256",
-        "--network", cfg.sandbox_network,
+        "--network", network_mode,
         "-v", f"{local}:/repo",
         "--workdir", "/repo",
         "--tmpfs", "/tmp:rw,size=512m",
@@ -135,7 +147,7 @@ def run_tests(cfg: Config, repo_slug: str, local: Path) -> SandboxResult:
         image,
         "sh", "-c", command,
     ]  # fmt: skip
-    log.info("sandbox: %s in %s (%s, network=%s)", repo_slug, image, cfg.sandbox_runtime, cfg.sandbox_network)
+    log.info("sandbox: %s in %s (%s, network=%s)", repo_slug, image, cfg.sandbox_runtime, network_mode)
 
     t0 = time.monotonic()
     try:

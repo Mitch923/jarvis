@@ -50,11 +50,11 @@ def read_log(logf) -> list[list[str]]:
 
 
 os.environ.update(DISCORD_TOKEN="x", DISCORD_ALLOWED_USER_IDS="1", OPENROUTER_API_KEY="k", GITHUB_TOKEN="")
-from config import Config
+from config import Config, ConfigError
 import sandbox as S
 
 
-RESETTABLE = ("TEST_COMMANDS", "SANDBOX_RUNTIME", "SANDBOX_MEMORY", "SANDBOX_CPUS", "SANDBOX_NETWORK", "SANDBOX_TIMEOUT", "GITHUB_TOKEN")
+RESETTABLE = ("TEST_COMMANDS", "SANDBOX_RUNTIME", "SANDBOX_MEMORY", "SANDBOX_CPUS", "SANDBOX_NETWORK", "SANDBOX_NETWORK_ALLOWED_REPOS", "SANDBOX_TIMEOUT", "GITHUB_TOKEN")
 
 
 def cfg(**overrides):
@@ -202,5 +202,77 @@ finally:
 calls = read_log(logf)
 assert not any("super-secret" in a for a in calls[0]), "secret leaked into the docker argv"
 ok("run_tests: no secret ever appears in the constructed docker command line")
+
+# ---------- run_tests: default-deny network (repo NOT in allowlist -> network=none)
+logf, restore = with_fake_docker([{"kind": "ok", "stdout": "ok\n", "code": 0}])
+try:
+    c8 = cfg(SANDBOX_RUNTIME="docker", SANDBOX_NETWORK="bridge", SANDBOX_NETWORK_ALLOWED_REPOS="other/allowed")
+    result = S.run_tests(c8, "me/proj", d)
+finally:
+    restore()
+assert result.ok
+calls = read_log(logf)
+argv = calls[0]
+assert argv[argv.index("--network") + 1] == "none", f"expected 'none' for non-allowlisted repo, got {argv[argv.index('--network') + 1]}"
+ok("run_tests: repo NOT in SANDBOX_NETWORK_ALLOWED_REPOS -> forced to network=none (default-deny)")
+
+# ---------- run_tests: allowlisted repo uses configured network mode
+logf, restore = with_fake_docker([{"kind": "ok", "stdout": "ok\n", "code": 0}])
+try:
+    c9 = cfg(SANDBOX_RUNTIME="docker", SANDBOX_NETWORK="bridge", SANDBOX_NETWORK_ALLOWED_REPOS="me/proj")
+    result = S.run_tests(c9, "me/proj", d)
+finally:
+    restore()
+assert result.ok
+calls = read_log(logf)
+argv = calls[0]
+assert argv[argv.index("--network") + 1] == "bridge", f"expected 'bridge' for allowlisted repo, got {argv[argv.index('--network') + 1]}"
+ok("run_tests: repo IN SANDBOX_NETWORK_ALLOWED_REPOS -> uses configured SANDBOX_NETWORK (bridge)")
+
+# ---------- run_tests: allowlisted repo with SANDBOX_NETWORK=none still gets none
+logf, restore = with_fake_docker([{"kind": "ok", "stdout": "ok\n", "code": 0}])
+try:
+    c10 = cfg(SANDBOX_RUNTIME="docker", SANDBOX_NETWORK="none", SANDBOX_NETWORK_ALLOWED_REPOS="me/proj")
+    result = S.run_tests(c10, "me/proj", d)
+finally:
+    restore()
+assert result.ok
+calls = read_log(logf)
+argv = calls[0]
+assert argv[argv.index("--network") + 1] == "none", f"expected 'none' for allowlisted repo with config=none, got {argv[argv.index('--network') + 1]}"
+ok("run_tests: allowlisted repo with SANDBOX_NETWORK=none -> network=none (config respected)")
+
+# ---------- run_tests: case-insensitive repo matching in allowlist
+logf, restore = with_fake_docker([{"kind": "ok", "stdout": "ok\n", "code": 0}])
+try:
+    c11 = cfg(SANDBOX_RUNTIME="docker", SANDBOX_NETWORK="bridge", SANDBOX_NETWORK_ALLOWED_REPOS="ME/PROJ")
+    result = S.run_tests(c11, "me/proj", d)
+finally:
+    restore()
+assert result.ok
+calls = read_log(logf)
+argv = calls[0]
+assert argv[argv.index("--network") + 1] == "bridge", f"expected 'bridge' for case-insensitive match, got {argv[argv.index('--network') + 1]}"
+ok("run_tests: allowlist matching is case-insensitive")
+
+# ---------- config: malformed SANDBOX_NETWORK_ALLOWED_REPOS entries fail closed
+old_allowed = os.environ.get("SANDBOX_NETWORK_ALLOWED_REPOS")
+os.environ["SANDBOX_NETWORK_ALLOWED_REPOS"] = "not-a-valid-repo-format"
+try:
+    Config.from_env()
+    assert False, "should have raised ConfigError"
+except ConfigError as e:
+    assert "SANDBOX_NETWORK_ALLOWED_REPOS entries must look like owner/name" in str(e)
+    ok("config: malformed SANDBOX_NETWORK_ALLOWED_REPOS -> fail-closed ConfigError")
+finally:
+    if old_allowed is None:
+        os.environ.pop("SANDBOX_NETWORK_ALLOWED_REPOS", None)
+    else:
+        os.environ["SANDBOX_NETWORK_ALLOWED_REPOS"] = old_allowed
+
+# ---------- config: SANDBOX_NETWORK default is now "none"
+c_default = cfg()
+assert c_default.sandbox_network == "none"
+ok("config: SANDBOX_NETWORK default is 'none'")
 
 print("sandbox.py: all checks passed")

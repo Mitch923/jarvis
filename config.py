@@ -110,6 +110,7 @@ class Config:
     sandbox_memory: str  # e.g. "1g", passed straight to the container runtime's --memory
     sandbox_cpus: str
     sandbox_network: str  # "bridge" (installs work, but the test run can reach the network) or "none"
+    sandbox_network_allowed_repos: frozenset[str]  # repos that may use bridge network; others forced to "none"
     test_commands: dict[str, str]  # "owner/repo" -> shell command (or "image|command"); "*" -> fallback
 
     @classmethod
@@ -179,9 +180,15 @@ class Config:
         sandbox_runtime = _str("SANDBOX_RUNTIME", "docker").lower()
         if sandbox_runtime not in ("docker", "podman", ""):
             raise ConfigError("SANDBOX_RUNTIME must be 'docker', 'podman', or empty to disable repo_test")
-        sandbox_network = _str("SANDBOX_NETWORK", "bridge").lower()
+        sandbox_network = _str("SANDBOX_NETWORK", "none").lower()
         if sandbox_network not in ("bridge", "none"):
             raise ConfigError("SANDBOX_NETWORK must be 'bridge' or 'none'")
+        sandbox_network_allowed_repos = frozenset(
+            r.lower().removeprefix("https://github.com/").strip("/") for r in _csv("SANDBOX_NETWORK_ALLOWED_REPOS")
+        )
+        bad = [r for r in sandbox_network_allowed_repos if not re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", r)]
+        if bad:
+            raise ConfigError(f"SANDBOX_NETWORK_ALLOWED_REPOS entries must look like owner/name: {', '.join(bad)}")
 
         test_commands: dict[str, str] = {}
         for pair in _str("TEST_COMMANDS").split(";"):
@@ -250,5 +257,6 @@ class Config:
             sandbox_memory=_str("SANDBOX_MEMORY", "1g"),
             sandbox_cpus=_str("SANDBOX_CPUS", "1.5"),
             sandbox_network=sandbox_network,
+            sandbox_network_allowed_repos=sandbox_network_allowed_repos,
             test_commands=test_commands,
         )

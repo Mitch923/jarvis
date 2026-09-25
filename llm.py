@@ -29,7 +29,8 @@ import random
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Any
 
 import openai
@@ -70,6 +71,34 @@ class LLMAborted(LLMError):
 
 class _BadResponse(Exception):
     """HTTP 200, but the body was unusable (OpenRouter sometimes does this)."""
+
+
+@dataclass(frozen=True)
+class _AttemptRecord:
+    """Single provider/model attempt record for observability."""
+    timestamp: float
+    provider: str
+    model: str
+    outcome: str  # success, timeout, rate_limited, auth_error, server_error, empty_response, other_error
+    latency_ms: int
+    error: str = ""
+
+
+@dataclass
+class _ProviderStats:
+    """Rolling stats per provider."""
+    attempts: int = 0
+    successes: int = 0
+    failures: dict[str, int] = field(default_factory=lambda: {
+        "timeout": 0,
+        "rate_limited": 0,
+        "auth_error": 0,
+        "server_error": 0,
+        "empty_response": 0,
+        "other_error": 0,
+    })
+    cooldown_until: float = 0.0
+    daily_blocked_until: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -145,6 +174,31 @@ def _classify(exc: BaseException) -> tuple[str, float | None]:
     return "bug", None  # our own mistake: don't swallow it
 
 
+def _classify_to_outcome(kind: str, exc: BaseException | None = None) -> str:
+    """Map _classify kind to observability outcome category."""
+    if kind == "transient":
+        # Check if it's a timeout specifically (APITimeoutError or connection error)
+        if exc and isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError)):
+            return "timeout"
+        return "server_error"
+    if kind == "rate_wait":
+        return "rate_limited"
+    if kind == "fatal":
+        return "auth_error"
+    if kind == "daily":
+        return "rate_limited"  # daily cap is a form of rate limiting
+    if kind == "model_down":
+        return "server_error"
+    if kind == "bad_request":
+        # Could be empty response or other client error
+        if exc and isinstance(exc, _BadResponse) and "empty" in str(exc).lower():
+            return "empty_response"
+        return "other_error"
+    if kind == "upstream":
+        return "server_error"
+    return "other_error"
+
+
 class ResilientModel(OpenAIServerModel):
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -163,6 +217,10 @@ class ResilientModel(OpenAIServerModel):
         self._PROSE_LIMIT = 3  # after this many, force a final_answer (last resort)
         self.abort = threading.Event()
         self.on_event = None  # optional callable(kind, model=..., detail=...) for the friction log
+
+        # Observability: ring buffer of attempts and per-provider rolling stats
+        self._attempt_log: deque[_AttemptRecord] = deque(maxlen=200)
+        self._provider_stats: dict[str, _ProviderStats] = {p.name: _ProviderStats() for p in self._providers}
 
         primary = self._providers[0]
         placeholder = next((m for m in primary.models if m != "auto"), "model")
@@ -215,7 +273,15 @@ class ResilientModel(OpenAIServerModel):
         lines = [f"Requests today (UTC): {self.requests_today} (failed: {self.failures_today})"]
         for p in self._providers:
             blocked = self._daily_block.get(p.name, 0) - now
-            lines.append(f"**{p.name}**" + (f" — ⛔ day cap, resets in {self._fmt_wait(blocked)}" if blocked > 0 else ""))
+            stats = self._provider_stats.get(p.name)
+            if stats:
+                total_failures = sum(stats.failures.values())
+                lines.append(
+                    f"**{p.name}** — attempts: {stats.attempts}, ok: {stats.successes}, "
+                    f"fail: {total_failures}" + (f" — ⛔ day cap, resets in {self._fmt_wait(blocked)}" if blocked > 0 else "")
+                )
+            else:
+                lines.append(f"**{p.name}**" + (f" — ⛔ day cap, resets in {self._fmt_wait(blocked)}" if blocked > 0 else ""))
             for m in self._provider_models(p.name):
                 left = self._cooldown.get((p.name, m), 0) - now
                 lines.append(f"• `{m}` — " + (f"cooling down {int(left)}s" if left > 0 else "ready"))
@@ -247,13 +313,21 @@ class ResilientModel(OpenAIServerModel):
             attempt = 0
             while attempt < self.cfg.llm_attempts_per_model:
                 self._check_abort(deadline)
+                start = time.perf_counter()
                 try:
                     self.requests_today += 1
-                    return self._call(provider, model_id, messages, stop_sequences, response_format, tools_to_call_from, **kwargs)
+                    result = self._call(provider, model_id, messages, stop_sequences, response_format, tools_to_call_from, **kwargs)
+                    latency_ms = int((time.perf_counter() - start) * 1000)
+                    self._record_attempt(provider, model_id, "success", latency_ms, "")
+                    return result
                 except Exception as exc:  # noqa: BLE001 - classified below
+                    latency_ms = int((time.perf_counter() - start) * 1000)
                     kind, wait = _classify(exc)
                     if kind == "bug":
                         raise
+                    outcome = _classify_to_outcome(kind, exc)
+                    error_msg = _short(exc, 150)
+                    self._record_attempt(provider, model_id, outcome, latency_ms, error_msg)
                     label = f"{provider}:{model_id}"
                     self.failures_today += 1
                     self.last_error = f"{label}: {_short(exc, 120)}"
@@ -376,6 +450,67 @@ class ResilientModel(OpenAIServerModel):
                 self.on_event(kind, model=model, detail=detail)
             except Exception:  # noqa: BLE001 - diagnostics must never break a call
                 log.exception("friction hook failed")
+
+    def _record_attempt(self, provider: str, model: str, outcome: str, latency_ms: int, error: str) -> None:
+        """Record an attempt in the ring buffer and update per-provider stats."""
+        now = time.time()
+        record = _AttemptRecord(
+            timestamp=now,
+            provider=provider,
+            model=model,
+            outcome=outcome,
+            latency_ms=latency_ms,
+            error=error,
+        )
+        self._attempt_log.append(record)
+        stats = self._provider_stats.get(provider)
+        if stats is None:
+            stats = _ProviderStats()
+            self._provider_stats[provider] = stats
+        stats.attempts += 1
+        if outcome == "success":
+            stats.successes += 1
+        else:
+            if outcome in stats.failures:
+                stats.failures[outcome] += 1
+            else:
+                stats.failures["other_error"] += 1
+        # Update cooldown state from internal tracking
+        for (p, m), until in self._cooldown.items():
+            if p == provider and until > stats.cooldown_until:
+                stats.cooldown_until = until
+        if self._daily_block.get(provider, 0) > stats.daily_blocked_until:
+            stats.daily_blocked_until = self._daily_block[provider]
+
+    def get_llm_stats_summary(self) -> dict[str, Any]:
+        """Return a summary of per-provider LLM stats for observability."""
+        now = time.time()
+        summary = {
+            "total_attempts": sum(s.attempts for s in self._provider_stats.values()),
+            "total_successes": sum(s.successes for s in self._provider_stats.values()),
+            "providers": {},
+        }
+        for name, stats in self._provider_stats.items():
+            failures = dict(stats.failures)
+            total_failures = sum(failures.values())
+            cooldown_remaining = max(0.0, stats.cooldown_until - now)
+            daily_blocked_remaining = max(0.0, stats.daily_blocked_until - now)
+            summary["providers"][name] = {
+                "attempts": stats.attempts,
+                "successes": stats.successes,
+                "failures": failures,
+                "total_failures": total_failures,
+                "success_rate": stats.successes / stats.attempts if stats.attempts > 0 else 0.0,
+                "cooldown_active": cooldown_remaining > 0,
+                "cooldown_remaining_sec": round(cooldown_remaining, 1),
+                "daily_blocked": daily_blocked_remaining > 0,
+                "daily_blocked_remaining_sec": round(daily_blocked_remaining, 1),
+            }
+        return summary
+
+    def get_recent_attempts(self, n: int = 20) -> list[_AttemptRecord]:
+        """Return the last N attempt records (newest first)."""
+        return list(self._attempt_log)[-n:][::-1]
 
     def _provider_models(self, name: str) -> list[str]:
         """This provider's configured models, with OpenRouter's 'auto' expanded to discovered ones."""

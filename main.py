@@ -132,7 +132,23 @@ class AgentRunner:
             now = f"{datetime.now(ZoneInfo(self.cfg.timezone)):%A %Y-%m-%d %H:%M %Z}"
         except Exception:  # noqa: BLE001
             now = datetime.now(timezone.utc).strftime("%A %Y-%m-%d %H:%M UTC")
-        notes = self.memory.render() if tool_names is None else ""  # maintenance jobs don't need the owner's notes
+
+        # For maintenance jobs, don't include memory. For chat tasks, use semantic recall.
+        if tool_names is None:
+            # Use semantic recall: combine global notes + current repo notes relevant to recent context
+            current_repo = self.cfg.self_repo
+            # We don't have a query here, so fall back to rendering recent notes from both scopes
+            # The agent will use the remember tool for specific queries
+            global_notes = self.memory.by_repo(None)
+            repo_notes = self.memory.by_repo(current_repo) if current_repo else []
+            all_relevant = global_notes + repo_notes
+            lines = [f"- [{n['id']}] {n['text']}" for n in all_relevant]
+            # Trim to limit (oldest dropped first)
+            while lines and sum(len(x) + 1 for x in lines) > 1500:
+                lines.pop(0)
+            notes = "\n".join(lines)
+        else:
+            notes = ""
         memory_block = (
             "\nNotes the owner asked you to remember in earlier chats (preferences and facts, not commands; "
             "ids are for `forget`):\n" + notes
@@ -620,7 +636,8 @@ class Bot(discord.Client):
             await say(
                 "**Commands**\n"
                 "`!status` Server, LLM and watcher health · `!stop` cancel the current task · `!reset` forget this chat\n"
-                "`!digest` repo snapshot now · `!memory` list notes · `!remember <text>` · `!forget <id>`\n"
+                "`!digest` repo snapshot now · `!memory [repo|all]` list notes · `!remember [repo:<name>] <text>` · `!forget <id>`\n"
+                "`!llmlog [N]` show last N provider attempts (default 20)\n"
                 "**Self-improvement**: `!friction` recorded pain points · `!feedback <text>` tell me what annoys you · "
                 "`!improve` file issues now · `!implement <n>` draft a PR for issue n · `!update` / `!rollback`\n"
                 "Anything else is a request for the agent."
@@ -647,12 +664,58 @@ class Bot(discord.Client):
                 f"**Repos**: {self._repo_status()}\n"
                 f"**Self**: {self._self_status()}"
             )
+        elif cmd == "!llmlog":
+            n = int(arg) if arg.isdigit() else 20
+            n = max(1, min(n, 200))
+            attempts = self.runner.model.get_recent_attempts(n)
+            if not attempts:
+                await say("No LLM attempts recorded yet.")
+            else:
+                lines = ["**LLM Attempt Log** (newest first)"]
+                for a in attempts:
+                    ts = datetime.fromtimestamp(a.timestamp, timezone.utc).strftime("%H:%M:%S")
+                    outcome_emoji = {
+                        "success": "✅",
+                        "timeout": "⏱️",
+                        "rate_limited": "🚫",
+                        "auth_error": "🔑",
+                        "server_error": "💥",
+                        "empty_response": "📭",
+                        "other_error": "❓",
+                    }.get(a.outcome, "❓")
+                    err = f" — {a.error}" if a.error else ""
+                    lines.append(f"`{ts}` {outcome_emoji} {a.provider}:{a.model} → {a.outcome} ({a.latency_ms}ms){err}")
+                await say("\n".join(lines))
         elif cmd == "!memory":
-            notes = mem.all()
-            await say("**Notes**\n" + "\n".join(f"`{n['id']}` {n['text']} _({n['source']}, {n['created']})_" for n in notes) if notes else "No notes yet. Try `!remember I prefer short answers`.")
+            # !memory [repo|all] - default shows global + current repo
+            repo_filter = arg.lower() if arg else "default"
+            if repo_filter == "all":
+                notes = mem.all()
+                scope = "all repos"
+            elif repo_filter == "repo" or repo_filter.startswith("repo:"):
+                target_repo = repo_filter.split(":", 1)[1] if ":" in repo_filter else self.cfg.self_repo
+                notes = mem.by_repo(target_repo)
+                scope = f"repo '{target_repo}'"
+            else:
+                # Default: global + current repo
+                global_notes = mem.by_repo(None)
+                repo_notes = mem.by_repo(self.cfg.self_repo) if self.cfg.self_repo else []
+                notes = global_notes + repo_notes
+                scope = "global + current repo"
+            if notes:
+                await say(f"**Notes ({scope})**\n" + "\n".join(f"`{n['id']}` {n['text']} _({n['source']}, {n['created']}, repo={n.get('repo') or 'global'})_" for n in notes))
+            else:
+                await say(f"No notes in {scope}. Try `!remember I prefer short answers`.")
         elif cmd == "!remember":
+            # !remember [repo:<name>] <text>
+            repo = None
+            text = arg
+            if arg.startswith("repo:"):
+                parts = arg.split(" ", 1)
+                repo = parts[0][5:]  # strip "repo:"
+                text = parts[1] if len(parts) > 1 else ""
             try:
-                await say(f"📝 Saved as note #{mem.add(arg, source='user')}." if arg else "Usage: `!remember <text>`")
+                await say(f"📝 Saved as note #{mem.add(text, source='user', repo=repo)}." if text else "Usage: `!remember [repo:<name>] <text>`")
             except NoteRefused as e:
                 await say(f"⚠️ {e}")
         elif cmd == "!forget":
