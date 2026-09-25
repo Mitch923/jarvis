@@ -250,5 +250,102 @@ def create_github_read_tools(cfg, gh, state: RunState, friction=None):
         talk = "\n".join(f"@{c['user']['login']}: {clip(c['body'] or '', 600)}" for c in comments)
         return untrusted(clip(head + "\n\n" + clip(i.get("body") or "(no description)", 3000) + ("\n\nComments:\n" + talk if talk else ""), limit_chars))
 
-    tools += [gh_repos, gh_browse, gh_search_code, gh_commits, gh_diff, gh_prs, gh_pr, gh_issues, gh_issue, gh_ci, gh_overview]
+    @tool
+    @_safe
+    def gh_pr_queue_status() -> str:
+        """Show statistics of the PR review queue (pending, reviewing, reviewed, skipped)."""
+        # Access watcher state via the shared watch.json file
+        import json
+        from pathlib import Path
+        from config import Config
+        cfg = Config.from_env()
+        watch_path = Path(cfg.data_dir) / "watch.json"
+        if not watch_path.exists():
+            return "PR queue is empty (no watch.json found)."
+        try:
+            state = json.loads(watch_path.read_text())
+        except (ValueError, OSError):
+            return "ERROR: could not read watch state."
+        queue = state.get("pr_queue", [])
+        stats = {"total": len(queue), "pending": 0, "reviewing": 0, "reviewed": 0, "skipped": 0}
+        for item in queue:
+            status = item.get("status", "pending")
+            if status in stats:
+                stats[status] += 1
+        lines = [f"PR Review Queue: {stats['total']} total"]
+        for k, v in stats.items():
+            if k != "total":
+                lines.append(f"  {k}: {v}")
+        return "\n".join(lines)
+
+    @tool
+    @_safe
+    def gh_next_pr_for_review() -> str:
+        """Get the next pending PR from the queue for automated review. Returns PR details and marks it as 'reviewing'.
+
+        Use gh_review_pr to post your review after analyzing the PR.
+        """
+        import json
+        from pathlib import Path
+        from config import Config
+        cfg = Config.from_env()
+        watch_path = Path(cfg.data_dir) / "watch.json"
+        if not watch_path.exists():
+            return "No PRs in queue (no watch.json found)."
+        try:
+            state = json.loads(watch_path.read_text())
+        except (ValueError, OSError):
+            return "ERROR: could not read watch state."
+        queue = state.get("pr_queue", [])
+        for i, item in enumerate(queue):
+            if item.get("status") == "pending":
+                # Mark as reviewing
+                from datetime import datetime, timezone
+                queue[i]["status"] = "reviewing"
+                queue[i]["review_started_at"] = datetime.now(timezone.utc).isoformat()
+                state["pr_queue"] = queue
+                watch_path.write_text(json.dumps(state))
+                return (f"Next PR for review:\n"
+                        f"  Repo: {item['repo']}\n"
+                        f"  PR: #{item['number']}\n"
+                        f"  Title: {item['title']}\n"
+                        f"  Author: @{item['author']}\n"
+                        f"  URL: {item['url']}\n"
+                        f"  Detected: {item['detected_at']}\n\n"
+                        f"Use gh_pr to read the PR details, then gh_review_pr to post your review.")
+        return "No pending PRs in queue."
+
+    @tool
+    @_safe
+    def gh_mark_pr_reviewed(repo: str, number: int, success: bool = True) -> str:
+        """Mark a PR as reviewed (or skipped) in the queue after posting a review.
+
+        Args:
+            repo: 'owner/name' or just 'name'.
+            number: Pull request number.
+            success: True if review was posted successfully, False to mark as skipped.
+        """
+        import json
+        from pathlib import Path
+        from datetime import datetime, timezone
+        from config import Config
+        cfg = Config.from_env()
+        watch_path = Path(cfg.data_dir) / "watch.json"
+        if not watch_path.exists():
+            return "ERROR: no watch.json found."
+        try:
+            state = json.loads(watch_path.read_text())
+        except (ValueError, OSError):
+            return "ERROR: could not read watch state."
+        queue = state.get("pr_queue", [])
+        for item in queue:
+            if item.get("repo") == repo and item.get("number") == number:
+                item["status"] = "reviewed" if success else "skipped"
+                item["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+                state["pr_queue"] = queue
+                watch_path.write_text(json.dumps(state))
+                return f"Marked PR #{number} in {repo} as {'reviewed' if success else 'skipped'}."
+        return f"ERROR: PR #{number} in {repo} not found in queue."
+
+    tools += [gh_repos, gh_browse, gh_search_code, gh_commits, gh_diff, gh_prs, gh_pr, gh_issues, gh_issue, gh_ci, gh_overview, gh_pr_queue_status, gh_next_pr_for_review, gh_mark_pr_reviewed]
     return tools

@@ -2,6 +2,7 @@
 
   * Watcher: notices new open PRs and newly failing CI (PRs and the default branch), once each.
   * Digest:  a snapshot of every allowlisted repo (also available on demand via !digest / gh_overview).
+  * PR Queue: queues newly detected PRs for automated agent review.
 """
 import json
 import logging
@@ -9,6 +10,7 @@ import os
 import threading
 import time
 from collections import deque
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -19,6 +21,18 @@ from ghclient import GitHub, GitHubError
 log = logging.getLogger("watcher")
 
 MAX_REPOS = 8
+
+
+@dataclass
+class QueuedPR:
+    """A PR queued for automated review."""
+    repo: str
+    number: int
+    title: str
+    url: str
+    author: str
+    detected_at: str  # ISO format
+    status: str = "pending"  # pending, reviewing, reviewed, skipped
 
 
 def age(iso: str) -> str:
@@ -98,7 +112,7 @@ class Watcher:
         self.repos = sorted(cfg.github_allowed_repos)[:MAX_REPOS]
         self.path = Path(cfg.data_dir) / "watch.json"
         self._lock = threading.RLock()
-        self.state: dict = {"repos": {}, "last_digest": ""}
+        self.state: dict = {"repos": {}, "last_digest": "", "pr_queue": []}
         self.last_poll = 0.0
         self.last_error = ""
         self._load()
@@ -157,6 +171,16 @@ class Watcher:
         for pr in prs:
             if pr["number"] not in known and not quiet:
                 out.append(f"🆕 **{slug}** PR #{pr['number']}: {pr['title'][:100]} by @{pr['user']['login']}\n<{pr['html_url']}>")
+                # Queue the new PR for automated review
+                queued = QueuedPR(
+                    repo=slug,
+                    number=pr["number"],
+                    title=pr["title"],
+                    url=pr["html_url"],
+                    author=pr["user"]["login"],
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                )
+                self.state["pr_queue"].append(asdict(queued))
         rs["prs"] = [pr["number"] for pr in prs]
 
         targets = [(f"PR #{pr['number']}", pr["head"]["sha"]) for pr in prs[:8]] + [(f"`{self.gh.default_branch(slug)}`", self.gh.default_branch(slug))]
@@ -177,3 +201,44 @@ class Watcher:
         rs["ci"] = list(seen)
         rs["init"] = True
         return out
+
+    # -- PR Queue methods for automated review --
+    def get_pr_queue(self) -> list[dict]:
+        """Get the current PR queue (all items)."""
+        with self._lock:
+            return list(self.state.get("pr_queue", []))
+
+    def get_next_pending_pr(self) -> dict | None:
+        """Get the next pending PR from the queue, mark it as 'reviewing'."""
+        with self._lock:
+            queue = self.state.get("pr_queue", [])
+            for i, item in enumerate(queue):
+                if item.get("status") == "pending":
+                    queue[i]["status"] = "reviewing"
+                    queue[i]["review_started_at"] = datetime.now(timezone.utc).isoformat()
+                    self.save()
+                    return queue[i]
+            return None
+
+    def mark_pr_reviewed(self, repo: str, number: int, success: bool = True) -> bool:
+        """Mark a PR as reviewed (or skipped if failed)."""
+        with self._lock:
+            queue = self.state.get("pr_queue", [])
+            for item in queue:
+                if item.get("repo") == repo and item.get("number") == number:
+                    item["status"] = "reviewed" if success else "skipped"
+                    item["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+                    self.save()
+                    return True
+            return False
+
+    def get_queue_stats(self) -> dict:
+        """Get statistics about the PR queue."""
+        with self._lock:
+            queue = self.state.get("pr_queue", [])
+            stats = {"total": len(queue), "pending": 0, "reviewing": 0, "reviewed": 0, "skipped": 0}
+            for item in queue:
+                status = item.get("status", "pending")
+                if status in stats:
+                    stats[status] += 1
+            return stats

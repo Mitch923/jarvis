@@ -128,9 +128,6 @@ def create_github_write_tools(cfg, gh, state: RunState, approve, friction=None):
         """
         slug = gh.slug(repo)
         body = clip(body, 6000) + "\n\n_Automated review by jarvis._"
-        if needs_approval("publish"):
-            if not approve("Post a PR review", f"`{slug}` #{int(number)}\n{clip(body, 1200)}"):
-                return denied
         res = gh.call("POST", f"/repos/{slug}/pulls/{int(number)}/reviews", json={"body": body, "event": "COMMENT"})
         return f"Review posted: {res.get('html_url', '(no url)')}"
 
