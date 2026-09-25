@@ -774,9 +774,9 @@ class Bot(discord.Client):
         past = "\n".join(f"User: {u}\nAssistant: {a}" for u, a in turns)
         return f"Earlier in this conversation:\n{past}\n\nNew request from the user:\n{text}"
 
-    def _step_callback(self, status: discord.Message, loop: asyncio.AbstractEventLoop):
+    def _step_callback(self, status: discord.Message, loop: asyncio.AbstractEventLoop, total_steps: int):
         last = {"t": 0.0}
-        total = self.cfg.max_steps
+        total = total_steps
 
         def on_step(step: ActionStep, agent=None):  # runs in the agent thread
             if step.is_final_answer:
@@ -829,8 +829,9 @@ class Bot(discord.Client):
             started = time.monotonic()
             try:
                 async with channel.typing():
+                    effective_max_steps = max_steps or self.cfg.max_steps
                     result = await self._execute(
-                        channel, message.author.id, prompt or self._prompt(channel.id, text), self._step_callback(status, loop),
+                        channel, message.author.id, prompt or self._prompt(channel.id, text), self._step_callback(status, loop, effective_max_steps),
                         tool_names=tool_names, max_steps=max_steps,
                     )  # fmt: skip
                 reply = result.text.strip() or "(the model returned an empty answer)"
