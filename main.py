@@ -465,8 +465,11 @@ class Bot(discord.Client):
 
     async def _ask(self, ctx: RunContext, title: str, detail: str) -> bool:
         view = ApprovalView(ctx.user_id, self.cfg.approval_timeout)
-        text = f"🔐 **Approval needed - {title}**\n{detail}"[:1900]
-        msg = await ctx.channel.send(text, view=view)
+        full_text = f"🔐 **Approval needed - {title}**\n{detail}"
+        chunks = chunk_message(full_text)
+        msg = await ctx.channel.send(chunks[0], view=view)
+        for part in chunks[1:]:
+            await ctx.channel.send(part)
         try:  # the View has its own timeout; this is a backstop so a tool thread can never hang
             await asyncio.wait_for(view.wait(), timeout=self.cfg.approval_timeout + 5)
         except asyncio.TimeoutError:
@@ -474,7 +477,7 @@ class Bot(discord.Client):
         if view.approved is None:
             for child in view.children:
                 child.disabled = True
-            await msg.edit(content=text[:1850] + "\n⌛ *No answer - treated as denied.*", view=view)
+            await msg.edit(content=chunks[0][:1850] + "\n⌛ *No answer - treated as denied.*", view=view)
         return bool(view.approved)
 
     # -------------------------------------------------------- messages

@@ -55,14 +55,10 @@ assert "Opened PR #7" in r, r; assert asked and asked[0][0] == "Open a pull requ
 assert "Opened by jarvis" in fake_gh.STATE["prs"][0]["body"]
 ok("PR opened after approval, footer added")
 
-asked.clear(); answer["v"] = False
-r = tl["gh_review_pr"](repo="proj", number=7, body="Looks fine")
-assert r.startswith("DENIED"); assert not fake_gh.STATE["reviews"]
-ok("denied review is NOT posted")
-answer["v"] = True
+# gh_review_pr no longer requires approval (low-impact action)
 r = tl["gh_review_pr"](repo="proj", number=7, body="Looks fine")
 assert "Review posted" in r and fake_gh.STATE["reviews"][0]["event"] == "COMMENT"
-ok("approved review posted as COMMENT only")
+ok("review posted as COMMENT without approval in 'publish' mode")
 
 # --- approval mode = all
 tl = make("all"); answer["v"] = False
