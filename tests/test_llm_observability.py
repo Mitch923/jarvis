@@ -150,10 +150,8 @@ assert a.error != ""
 ok("failed attempt recorded with outcome and error")
 
 # --- per-provider stats tracked independently ---
-os.environ["PROVIDERS"] = "openrouter,google"
+# Use only openrouter (already configured) to avoid needing extra credentials
 m = new()
-del os.environ["PROVIDERS"]
-# Need separate fake servers for multi-provider test - skip complex setup
 # The unit test above for stats shape covers the structure
 
 # --- describe() includes per-provider stats ---

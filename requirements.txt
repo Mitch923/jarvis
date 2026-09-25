@@ -3,6 +3,7 @@ smolagents[openai]>=1.26,<2   # pulls openai, requests, rich, jinja2, pillow, py
 discord.py>=2.4,<3
 ddgs>=9,<10                  # DuckDuckGo search, no API key
 markdownify>=1.0              # HTML -> Markdown for visit_webpage
+numpy>=1.24,<3                # Required for test_memory.py mock embeddings
 
 # Optional: sentence-transformers>=3.0,<4  # Local embeddings for semantic memory recall (all-MiniLM-L6-v2)
 # Install with: pip install sentence-transformers>=3.0,<4
