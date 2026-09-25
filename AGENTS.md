@@ -20,6 +20,12 @@ This repository is a Discord-driven AI agent (jarvis) for a home server. It answ
 - PRs the bot opens on its own repo are always **draft** and titled `self: …`.
 - `LOCKED_PATHS` and `LOCKED_EXISTING` in `tools/github_write.py` (after Part A) define files the agent may never modify in its own repo.
 
+## Branch & PR policy
+- **ALL changes must be made on a separate branch** (not `main`).
+- **ALL changes must be merged via a Pull Request** with human review.
+- Direct pushes to `main` are prohibited.
+- The agent enforces `agent/*` branch prefix for its own work (see above).
+
 ## Testing conventions
 - Tests are standalone scripts, not a framework. They print `PASS <description>` and use assertions that fail hard.
 - Prefer real local git repos over mocking for git-related tests.
