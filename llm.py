@@ -402,9 +402,14 @@ class ResilientModel(OpenAIServerModel):
         self.model_id = f"{provider}:{model_id}"  # so agent logs and the friction log show which model answered
         if out.tool_calls:
             self._prose_count = 0  # a real tool call ends any thinking streak
-        elif tools and out.content and out.content.strip():
-            out = self._handle_prose(out, tools)
-        return out
+            return out
+        if not tools or not (out.content and out.content.strip()):
+            return out  # no tool calling in play: plain text reply, hand it back as-is
+        # Prose-only reply while tool calling was requested. Resolve it *here*, before the
+        # agent's own parsing stage ever sees the text: the agent would otherwise try to read a
+        # JSON tool-call blob out of plain prose and raise AgentParsingError ("does not contain
+        # any JSON blob") - the exact error this file's prose fallback exists to prevent.
+        return self._handle_prose(out, tools)
 
     def _handle_prose(self, msg: ChatMessage, tools: list) -> ChatMessage:
         """Resolve a prose-only reply while tool calling is enabled.
