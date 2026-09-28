@@ -171,7 +171,6 @@ def create_github_write_tools(cfg, gh, state: RunState, approve, friction=None):
             body: The comment text (Markdown).
         """
         slug = gh.slug(repo)
-        body = gh.slug(repo))
         body = clip(body, 6000) + "\n\n_Automated comment by jarvis._"
         res = gh.call("POST", f"/repos/{slug}/issues/{int(number)}/comments", json={"body": body})
         return f"Comment posted: {res.get('html_url', '(no url)')}"
