@@ -3,6 +3,7 @@
   * Watcher: notices new open PRs and newly failing CI (PRs and the default branch), once each.
   * Digest:  a snapshot of every allowlisted repo (also available on demand via !digest / gh_overview).
   * PR Queue: queues newly detected PRs for automated agent review.
+  * Mentions: detects @jarvis mentions in PR comments and queues those PRs for response.
 """
 import json
 import logging
