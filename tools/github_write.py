@@ -148,6 +148,21 @@ def create_github_write_tools(cfg, gh, state: RunState, approve, friction=None):
 
     @tool
     @_safe
+    def gh_comment_pr(repo: str, number: int, body: str) -> str:
+        """Post a comment on a pull request.
+
+        Args:
+            repo: 'owner/name' or just 'name'.
+            number: Pull request number.
+            body: The comment text (Markdown).
+        """
+        slug = gh.slug(repo)
+        body = clip(body, 6000) + "\n\n_Comment by jarvis._"
+        res = gh.call("POST", f"/repos/{slug}/issues/{int(number)}/comments", json={"body": body})
+        return f"Comment posted: {res.get('html_url', '(no url)')}"
+
+    @tool
+    @_safe
     def gh_open_issue(repo: str, title: str, body: str) -> str:
         """File a GitHub issue on YOUR OWN source repo. Only works during the weekly self-review, a few per run.
 
