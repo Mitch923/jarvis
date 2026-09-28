@@ -160,5 +160,21 @@ def create_github_write_tools(cfg, gh, state: RunState, approve, friction=None):
         state.issue_budget -= 1
         return f"Filed issue #{issue['number']}: {issue['html_url']} ({state.issue_budget} more allowed)"
 
-    tools += [gh_edit_file, gh_write_file, gh_open_pr, gh_review_pr, gh_open_issue]
+    @tool
+    @_safe
+    def gh_comment_pr(repo: str, number: int, body: str) -> str:
+        """Post a comment on a pull request (not a review).
+
+        Args:
+            repo: 'owner/name' or just 'name'.
+            number: Pull request number.
+            body: The comment text (Markdown).
+        """
+        slug = gh.slug(repo)
+        body = gh.slug(repo))
+        body = clip(body, 6000) + "\n\n_Automated comment by jarvis._"
+        res = gh.call("POST", f"/repos/{slug}/issues/{int(number)}/comments", json={"body": body})
+        return f"Comment posted: {res.get('html_url', '(no url)')}"
+
+    tools += [gh_edit_file, gh_write_file, gh_open_pr, gh_review_pr, gh_open_issue, gh_comment_pr]
     return tools
