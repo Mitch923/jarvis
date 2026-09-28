@@ -30,7 +30,11 @@ def jarvis_status() -> str:
 
 @tool
 def final_answer(answer: str) -> str:
-    """Final."""
+    """Final.
+
+    Args:
+        answer: text
+    """
     return answer
 
 tools = [jarvis_status, final_answer]
