@@ -87,6 +87,7 @@ class Config:
     # --- Background jobs (no LLM involved, so they cost no free-tier requests) ---
     notify_channel_id: int  # 0 = DM the primary user
     watch_interval: float  # seconds between GitHub polls; 0 = watcher off
+    pr_review_interval: float  # seconds between PR review processing; 0 = no automatic review
     digest_time: str  # "HH:MM" in AGENT_TIMEZONE; "" = no daily digest
 
     # --- Self-improvement ---
