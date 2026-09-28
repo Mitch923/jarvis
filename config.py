@@ -241,6 +241,7 @@ class Config:
             approval_timeout=_float("APPROVAL_TIMEOUT", 180),
             notify_channel_id=notify_channel,
             watch_interval=0 if not _float("WATCH_INTERVAL", 300) else max(60.0, _float("WATCH_INTERVAL", 300)),
+            pr_review_interval=max(0.0, _float("PR_REVIEW_INTERVAL", 0)),
             digest_time=digest,
             self_repo=self_repo,
             self_review_day=-1 if day == "off" else days.index(day),
