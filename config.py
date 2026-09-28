@@ -88,6 +88,7 @@ class Config:
     notify_channel_id: int  # 0 = DM the primary user
     watch_interval: float  # seconds between GitHub polls; 0 = watcher off
     digest_time: str  # "HH:MM" in AGENT_TIMEZONE; "" = no daily digest
+    pr_review_interval: float  # seconds between automatic PR review attempts; 0 = no automatic review
 
     # --- Self-improvement ---
     self_repo: str  # this bot's own GitHub repo (owner/name); blank = detect from the git checkout
