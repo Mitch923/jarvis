@@ -242,6 +242,7 @@ class Config:
             notify_channel_id=notify_channel,
             watch_interval=0 if not _float("WATCH_INTERVAL", 300) else max(60.0, _float("WATCH_INTERVAL", 300)),
             digest_time=digest,
+            pr_review_interval=0 if not _float("PR_REVIEW_INTERVAL", 0) else max(60.0, _float("PR_REVIEW_INTERVAL", 0)),
             self_repo=self_repo,
             self_review_day=-1 if day == "off" else days.index(day),
             self_review_time=review_time,
