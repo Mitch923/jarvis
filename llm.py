@@ -400,10 +400,17 @@ class ResilientModel(OpenAIServerModel):
             else None,
         )
         self.model_id = f"{provider}:{model_id}"  # so agent logs and the friction log show which model answered
-        if out.tool_calls:
-            self._prose_count = 0  # a real tool call ends any thinking streak
-        elif tools and out.content and out.content.strip():
+
+        # Handle prose responses early to prevent AgentParsingError downstream.
+        # If the model returned prose (no tool_calls but has content) while tools are enabled,
+        # process it through _handle_prose which can:
+        # - Extract JSON tool calls embedded in the text
+        # - Convert to a thinking step (re-prompt)
+        # - Force final_answer after _PROSE_LIMIT consecutive prose replies
+        if tools and out.content and out.content.strip() and not out.tool_calls:
             out = self._handle_prose(out, tools)
+        elif out.tool_calls:
+            self._prose_count = 0  # a real tool call ends any thinking streak
         return out
 
     def _handle_prose(self, msg: ChatMessage, tools: list) -> ChatMessage:
