@@ -42,6 +42,17 @@ class Friction:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 if self.path.exists() and self.path.stat().st_size > MAX_BYTES:
                     os.replace(self.path, self.path.with_suffix(".jsonl.1"))
+                    # Clean up oldest rotated files beyond the cap
+                    rotated = sorted(
+                        (p for p in self.path.parent.glob(self.path.name + ".*") if p.suffix != ".jsonl"),
+                        key=lambda p: p.stat().st_mtime,
+                    )
+                    while len(rotated) > MAX_ROTATED:
+                        oldest = rotated.pop(0)
+                        try:
+                            oldest.unlink()
+                        except OSError:
+                            pass
                 with self.path.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception:  # noqa: BLE001
