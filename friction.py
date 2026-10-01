@@ -18,6 +18,7 @@ from memory import SECRET_RE
 log = logging.getLogger("friction")
 
 MAX_BYTES = 256_000  # then rotate; keeps roughly the last few weeks and never grows without bound
+MAX_ROTATED = 7  # keep at most this many rotated files (friction.jsonl.1 .. .7)
 
 
 class Friction:
