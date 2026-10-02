@@ -1,6 +1,6 @@
 import sys, tempfile, time
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
-from friction import Friction, MAX_BYTES
+from friction import Friction, MAX_BYTES, MAX_ROTATED
 ok = lambda s: print("PASS", s)
 
 d = tempfile.mkdtemp(); f = Friction(d)
@@ -51,3 +51,25 @@ assert f2.path.stat().st_size < size_before_rotate
 ok(f"friction log rotates past {MAX_BYTES} bytes ({i} events)")
 assert len(f2.events(days=7)) > 0
 ok("events readable across the rotated + current file")
+
+# rotation cap: force many more rotations than MAX_ROTATED and assert the oldest are deleted
+from pathlib import Path
+import friction as _friction
+
+d3 = tempfile.mkdtemp(); f3 = Friction(d3)
+real_max = _friction.MAX_BYTES
+_friction.MAX_BYTES = 2_000  # tiny threshold so a dozen rotations happen in a second
+try:
+    for _ in range((MAX_ROTATED + 5) * 60):
+        f3.record("tool_error", tool="t", detail=big)
+finally:
+    _friction.MAX_BYTES = real_max
+rotated = list(Path(d3).glob("friction.jsonl.*"))
+assert len(rotated) <= MAX_ROTATED, f"{len(rotated)} rotated files kept, cap is {MAX_ROTATED}"
+ok(f"rotation keeps at most {MAX_ROTATED} rotated files ({len(rotated)} kept after {MAX_ROTATED + 5}+ rotations)")
+
+# events() must still see the older rotations, not just .1 and the current file
+newest_two = [Path(d3) / "friction.jsonl", Path(d3) / "friction.jsonl.1"]
+readable = sum(len(p.read_text(encoding="utf-8").splitlines()) for p in newest_two if p.exists())
+assert len(f3.events(days=7)) > readable, "events() is missing the older rotated files"
+ok("events() reads every rotated file, not just .1")
