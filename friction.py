@@ -42,7 +42,9 @@ class Friction:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 if self.path.exists() and self.path.stat().st_size > MAX_BYTES:
                     os.replace(self.path, self.path.with_suffix(".jsonl.1"))
-                    # Clean up oldest rotated files beyond the cap
+                    # Clean up oldest rotated files beyond the cap.
+                    # The suffix filter is redundant (glob friction.jsonl.* can't match the base file),
+                    # kept for clarity so the next reader doesn't wonder why it's there.
                     rotated = sorted(
                         (p for p in self.path.parent.glob(self.path.name + ".*") if p.suffix != ".jsonl"),
                         key=lambda p: p.stat().st_mtime,
