@@ -1,6 +1,6 @@
 import sys, tempfile, time
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
-from friction import Friction, MAX_BYTES
+from friction import Friction, MAX_BYTES, MAX_ROTATED
 ok = lambda s: print("PASS", s)
 
 d = tempfile.mkdtemp(); f = Friction(d)
