@@ -61,13 +61,17 @@ class Friction:
             log.exception("could not record friction event")
 
     def events(self, days: float = 7, since: Optional[str] = None) -> list[dict]:
-        """Events from the last `days`, optionally only those after ISO timestamp `since`."""
+        """Events from the last `days`, optionally only those after ISO timestamp `since`.
+
+        Reads the current file plus every rotated sibling (friction.jsonl.1 .. .N), newest first,
+        so the cap on rotated files can't hide events that are still inside the reporting window.
+        """
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
         if since and since > cutoff:
             cutoff = since
         out: list[dict] = []
         with self._lock:
-            for p in (self.path.with_suffix(".jsonl.1"), self.path):
+            for p in self._files_newest_first():
                 try:
                     lines = p.read_text(encoding="utf-8").splitlines()
                 except OSError:
