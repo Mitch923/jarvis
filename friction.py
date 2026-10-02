@@ -26,6 +26,18 @@ class Friction:
         self.path = Path(data_dir) / "friction.jsonl"
         self._lock = threading.Lock()
 
+    def _files_newest_first(self) -> list[Path]:
+        """Current log plus every rotated sibling, newest first (caller holds the lock)."""
+        files = [self.path]
+        for p in self.path.parent.glob(self.path.name + ".*"):
+            if p.is_file():
+                files.append(p)
+        try:
+            files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError:
+            pass  # a file vanished mid-listing; events() skips unreadable files anyway
+        return files
+
     def record(self, kind: str, *, tool: str = "", model: str = "", detail: str = "", steps: Optional[int] = None) -> None:
         """Append one event. Never raises: logging a problem must not cause another one."""
         try:
