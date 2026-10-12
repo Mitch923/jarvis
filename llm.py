@@ -99,6 +99,7 @@ class _ProviderStats:
     })
     cooldown_until: float = 0.0
     daily_blocked_until: float = 0.0
+    consecutive_empty_responses: int = 0  # track empty responses for faster provider skip
 
 
 @dataclass(frozen=True)
