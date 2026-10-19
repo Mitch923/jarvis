@@ -1,6 +1,8 @@
 """GitHub watcher + daily digest. Plain polling: NO LLM calls, so it costs no free-tier requests.
 
   * Watcher: notices new open PRs and newly failing CI (PRs and the default branch), once each.
+    It also emits normalized `RepoEvent`s (KIND_PR_OPENED / KIND_CI_FAILED) that `main._watch_loop`
+    drains onto the `EventBus`, so one handler set serves both polling and webhooks.
   * Digest:  a snapshot of every allowlisted repo (also available on demand via !digest / gh_overview).
   * PR Queue: queues newly detected PRs for automated agent review.
 """
@@ -17,6 +19,8 @@ from zoneinfo import ZoneInfo
 
 from config import Config
 from ghclient import GitHub, GitHubError
+from events import KIND_CI_FAILED, KIND_PR_OPENED, RepoEvent, synthetic_delivery_id
+from state import State
 
 log = logging.getLogger("watcher")
 
@@ -106,13 +110,18 @@ def seconds_until(hhmm: str, tz_name: str, weekday: "int | None" = None) -> floa
 
 
 class Watcher:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, state: State | None = None):
         self.cfg = cfg
         self.gh = GitHub(cfg)  # own session: safe to use from a background thread
         self.repos = sorted(cfg.github_allowed_repos)[:MAX_REPOS]
         self.path = Path(cfg.data_dir) / "watch.json"
         self._lock = threading.RLock()
         self.state: dict = {"repos": {}, "last_digest": "", "pr_queue": []}
+        # State store (dedupe/caps) for proactive features; optional in the digest-only path.
+        self._state = state
+        # RepoEvents accumulated during poll() and handed to the async bus.
+        self._pending_events: list[RepoEvent] = []
+        self._events_lock = threading.Lock()
         self.last_poll = 0.0
         self.last_error = ""
         self._load()
@@ -181,11 +190,25 @@ class Watcher:
                     detected_at=datetime.now(timezone.utc).isoformat(),
                 )
                 self.state["pr_queue"].append(asdict(queued))
+                self._add_event(RepoEvent(
+                    kind=KIND_PR_OPENED,
+                    repo=slug,
+                    delivery_id=synthetic_delivery_id(slug, KIND_PR_OPENED, pr["head"]["sha"]),
+                    pr_number=pr["number"],
+                    branch=pr["head"].get("ref"),
+                    head_sha=pr["head"]["sha"],
+                    run_id=None,
+                    actor=pr["user"]["login"],
+                    received_at=time.time(),
+                ))
         rs["prs"] = [pr["number"] for pr in prs]
 
         targets = [(f"PR #{pr['number']}", pr["head"]["sha"]) for pr in prs[:8]] + [(f"`{self.gh.default_branch(slug)}`", self.gh.default_branch(slug))]
         seen = deque(rs["ci"], maxlen=400)
         for label, ref in targets:
+            is_pr = label.startswith("PR #")
+            pr_number = int(label.split("PR #", 1)[1]) if is_pr else None
+            branch = label.strip("`") if not is_pr else None
             try:
                 ci = self.gh.checks(slug, ref)
             except GitHubError as e:
@@ -198,9 +221,33 @@ class Watcher:
                 seen.append(key)
                 if not quiet:
                     out.append(f"❌ **{slug}** {label}: CI check `{f['name']}` failed\n<{f['url']}>" if f["url"] else f"❌ **{slug}** {label}: CI check `{f['name']}` failed")
+                    self._add_event(RepoEvent(
+                        kind=KIND_CI_FAILED,
+                        repo=slug,
+                        delivery_id=synthetic_delivery_id(slug, KIND_CI_FAILED, f["sha"][:12]),
+                        pr_number=pr_number,
+                        branch=branch,
+                        head_sha=f["sha"][:12],
+                        run_id=None,
+                        actor=None,
+                        received_at=time.time(),
+                    ))
         rs["ci"] = list(seen)
         rs["init"] = True
         return out
+
+    # -- event emission (normalized RepoEvents for the async bus) --
+    def _add_event(self, event: RepoEvent) -> None:
+        """Accumulate one event for the next drain. Thread-safe: poll() runs in a thread."""
+        with self._events_lock:
+            self._pending_events.append(event)
+
+    def drain_events(self) -> list[RepoEvent]:
+        """Return and clear the events accumulated since the last drain."""
+        with self._events_lock:
+            events = list(self._pending_events)
+            self._pending_events.clear()
+            return events
 
     # -- PR Queue methods for automated review --
     def get_pr_queue(self) -> list[dict]:

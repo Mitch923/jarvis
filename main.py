@@ -29,9 +29,11 @@ from llm import (
     LLMUnavailableError,
     ResilientModel,
 )
+from events import EventBus, RepoEvent, KIND_CI_FAILED, KIND_PR_OPENED
 from friction import Friction
 from ghclient import GitHub, GitHubError
 from memory import Memory, NoteRefused
+from state import State
 from tools import LOCKED_PATHS, RunState, build_tools, system_report
 from updater import APP_DIR, UpdateError, Updater, ci_state
 from watcher import Watcher, seconds_until
@@ -116,12 +118,12 @@ class RunResult:
 class AgentRunner:
     """Owns the model + tools; runs one agent task at a time in a worker thread."""
 
-    def __init__(self, cfg: Config, approve: Callable[[str, str], bool]):
+    def __init__(self, cfg: Config, approve: Callable[[str, str], bool], friction: Friction | None = None):
         self.cfg = cfg
         self.model = ResilientModel(cfg)
         self.memory = Memory(cfg.data_dir, cfg.memory_max_notes)
         self.state = RunState()
-        self.friction = Friction(cfg.data_dir)
+        self.friction = friction if friction is not None else Friction(cfg.data_dir)
         self.model.on_event = lambda kind, model="", detail="": self.friction.record(kind, model=model, detail=detail)
         self.tools = build_tools(cfg, approve, self.memory, self.state, self.friction)
         self.current = None
@@ -195,10 +197,11 @@ class AgentRunner:
         tool_names: set[str] | None = None,
         max_steps: int | None = None,
         issue_budget: int = 0,
+        timeout: float | None = None,
     ) -> RunResult:
         """Run one task and record its outcome in the friction log."""
         try:
-            result = await self._run(prompt, on_step, tool_names, max_steps, issue_budget)
+            result = await self._run(prompt, on_step, tool_names, max_steps, issue_budget, timeout)
         except asyncio.CancelledError:
             raise
         except BaseException as e:  # noqa: BLE001 - classify, record, re-raise
@@ -216,7 +219,8 @@ class AgentRunner:
             self.friction.record("run_max_steps", model=result.model, detail=f"used all {max_steps or self.cfg.max_steps} steps")
         return result
 
-    async def _run(self, prompt, on_step, tool_names, max_steps, issue_budget) -> RunResult:
+    async def _run(self, prompt, on_step, tool_names, max_steps, issue_budget, timeout: float | None = None) -> RunResult:
+        effective_timeout = timeout if timeout is not None else self.cfg.run_timeout
         agent = self.make_agent(on_step, tool_names, max_steps)
         self.current = agent
         self.model.begin_run()
@@ -224,9 +228,9 @@ class AgentRunner:
         self.state.issue_budget = issue_budget
         work = asyncio.ensure_future(asyncio.to_thread(agent.run, prompt))
         try:
-            done, _ = await asyncio.wait({work}, timeout=self.cfg.run_timeout)
+            done, _ = await asyncio.wait({work}, timeout=effective_timeout)
             if not done:
-                log.warning("Run exceeded %ss - interrupting", self.cfg.run_timeout)
+                log.warning("Run exceeded %ss - interrupting", effective_timeout)
                 self.stop()
                 # every blocking call inside has its own timeout, so the thread winds down soon
                 await asyncio.wait({work}, timeout=self.cfg.llm_call_deadline + 30)
@@ -250,6 +254,121 @@ class AgentRunner:
 
 
 # ═════════════════════════════════════════════════════════════ discord helpers
+
+
+# ═════════════════════════════════════════════════════════════════════════════ task queue
+
+
+@dataclass
+class Task:
+    """One unit of work handed to the TaskQueue.
+
+    kind
+        "user"        user-initiated chat request (reply to the original message).
+        "self-review" proactive weekly review of our own repo (sent to the notify target).
+        "ci-fix"      proactive auto-fix of a newly failing CI (future feature).
+        "auto-review" proactive auto-review of a newly opened PR (future feature).
+
+    PROACTIVE tasks (self-review, ci-fix, auto-review) run in the background and are subject
+    to the quiet-hours / per-day-cap notify policy. USER tasks always deliver.
+    """
+
+    kind: str
+    prompt: str
+    message: discord.Message | None  # None = proactive (channel.send, no reply-to)
+    channel: discord.abc.Messageable
+    user_id: int
+    tool_names: set[str] | None
+    max_steps: int | None
+    remember: bool        # append to chat history (user tasks only)
+    issue_budget: int     # self-review issue budget
+    header: str | None    # optional header prepended to the result (e.g. self-review)
+    timeout: float | None  # None = cfg.run_timeout (user tasks)
+    priority: int         # TaskQueue.USER or TaskQueue.PROACTIVE
+    seq: int = 0          # set by the queue for FIFO ordering
+    done: asyncio.Event | None = None
+    result_text: str | None = None
+
+
+class TaskQueue:
+    """Priority queue of Tasks.
+
+    USER (0) always runs before PROACTIVE (1); within a priority it is FIFO (by seq).
+    A running task always finishes before the next queued one starts (no preemption).
+    PROACTIVE tasks are capped: when the queue already holds `proactive_queue_max` proactive
+    tasks, the oldest is dropped (and the drop is recorded as friction) before the newest
+    is admitted.
+    """
+
+    USER = 0
+    PROACTIVE = 1
+
+    def __init__(self, cfg: Config, friction: Friction):
+        self.cfg = cfg
+        self.friction = friction
+        self._cond = asyncio.Condition()
+        self._items: list[Task] = []
+        self._seq = 0
+        self._running = False
+        self._closed = False
+
+    async def enqueue(self, task: "Task") -> None:
+        async with self._cond:
+            if self._closed:
+                if task.done is not None:
+                    task.done.set()
+                return
+            if task.priority == TaskQueue.PROACTIVE:
+                cap = self.cfg.proactive_queue_max
+                queued = [i for i in self._items if i.priority == TaskQueue.PROACTIVE]
+                if len(queued) >= cap:
+                    oldest = min(queued, key=lambda x: x.seq)
+                    self._items.remove(oldest)
+                    self.friction.record(
+                        "proactive_queue_full",
+                        detail=f"dropped {oldest.kind} task (proactive queue full, cap {cap})",
+                    )
+            task.seq = self._seq
+            self._seq += 1
+            self._items.append(task)
+            self._cond.notify()
+
+    async def pop(self) -> "Task | None":
+        async with self._cond:
+            while not self._closed and not self._items:
+                await self._cond.wait()
+            if self._closed:
+                return None
+            self._items.sort(key=lambda x: (x.priority, x.seq))
+            item = self._items.pop(0)
+            self._running = True
+            return item
+
+    async def is_busy(self) -> bool:
+        """True if a task is running OR anything is queued."""
+        async with self._cond:
+            return self._running or bool(self._items)
+
+    async def proactive_pending(self) -> int:
+        async with self._cond:
+            return sum(1 for i in self._items if i.priority == TaskQueue.PROACTIVE)
+
+    async def queued(self) -> int:
+        """Tasks waiting to run (excluding the one in flight)."""
+        async with self._cond:
+            return len(self._items)
+
+    async def mark_done(self) -> None:
+        """Called by the consumer once the popped task has finished."""
+        async with self._cond:
+            self._running = False
+
+    def close(self) -> None:
+        self._closed = True
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
 
 def chunk_message(text: str, limit: int = 1900) -> list[str]:
@@ -339,15 +458,39 @@ class Bot(discord.Client):
         # The model must never be able to ping @everyone / roles, even if prompt-injected.
         super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.cfg = cfg
-        self.lock = asyncio.Lock()  # one agent run at a time: limited RAM and rate-limited LLM
+        # Serializes the updater's filesystem ops (apply/rollback) so two
+        # concurrent update commands don't rewrite the tree at once. Agent
+        # runs are serialized by the TaskQueue (see `self.queue`).
+        self.lock = asyncio.Lock()
         self.run_ctx: RunContext | None = None
         self.history: dict[int, deque[tuple[str, str]]] = {}
-        self.runner = AgentRunner(cfg, self._approve_from_thread)
-        self.watcher = Watcher(cfg)
+        self.state = State(cfg)
+        self.friction = Friction(cfg.data_dir)
+        self.bus = EventBus()
+        self.queue = TaskQueue(cfg, friction=self.friction)
+        self.runner = AgentRunner(cfg, self._approve_from_thread, friction=self.friction)
+        self.watcher = Watcher(cfg, state=self.state)
         self.updater = Updater(APP_DIR, cfg.github_token)
         self.restart_requested = False
         self._booted = False
         self._jobs: list[asyncio.Task] = []
+        self._consumer_task: asyncio.Task | None = None
+        self._pending_alerts: list[str] = []
+        self.last_event_at: float | None = None
+        self.webhook_last_event: float | None = None
+
+    def _start_consumer(self) -> None:
+        """Ensure the single task-consumption loop is running (idempotent).
+
+        Started by `setup_hook` in production; also started on demand from the
+        user-task paths so a bot that never reaches `setup_hook` (tests) can
+        still deliver user tasks.
+        """
+        if self._consumer_task is None or self._consumer_task.done():
+            self._consumer_task = asyncio.create_task(
+                self._task_loop(), name="task"
+            )
+            self._jobs.append(self._consumer_task)
 
     @property
     def self_ready(self) -> bool:
@@ -374,10 +517,16 @@ class Bot(discord.Client):
             except Exception:  # noqa: BLE001
                 log.exception("boot report failed")
 
-    # -------------------------------------------------------- background jobs (no LLM calls)
+    # -------------------------------------------------------- background jobs
 
     async def setup_hook(self):
         cfg, w = self.cfg, self.watcher
+        # Core task-consumption jobs (independent of GitHub config):
+        # one consumer for the queue, one for the event bus, one to flush
+        # quiet-hours-batched proactive alerts.
+        self._start_consumer()
+        self._jobs.append(asyncio.create_task(self._event_consumer(), name="events"))
+        self._jobs.append(asyncio.create_task(self._alert_flush_loop(), name="alerts"))
         if w.enabled:
             if cfg.watch_interval:
                 self._jobs.append(asyncio.create_task(self._watch_loop(), name="watch"))
@@ -394,8 +543,11 @@ class Bot(discord.Client):
                 log.info("Weekly self-review off: %s", self._self_off_reason())
 
     async def close(self):
+        self.queue.close()
         for job in self._jobs:
             job.cancel()
+        await asyncio.gather(*self._jobs, return_exceptions=True)
+        await self.bus.close()
         await super().close()
 
     async def _notify_target(self):
@@ -424,6 +576,10 @@ class Bot(discord.Client):
                 messages = await asyncio.to_thread(self.watcher.poll)
                 if messages:
                     await self._notify("\n".join(messages))
+                # Hand each freshly detected change to the async bus for routing
+                # (deduped by the event consumer against state.seen_deliveries).
+                for event in self.watcher.drain_events():
+                    await self.bus.put(event)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - a bad poll must never kill the loop
@@ -448,6 +604,209 @@ class Bot(discord.Client):
             except Exception:  # noqa: BLE001
                 log.exception("digest failed")
                 await asyncio.sleep(300)
+
+    # -------------------------------------------------------- proactive task engine
+
+    async def _task_loop(self):
+        """Single consumer of the TaskQueue: one queued task at a time.
+
+        USER tasks reply to their originating message; PROACTIVE tasks
+        (self-review, later ci-fix/auto-review) deliver via the notify policy.
+        """
+        while not self.queue.closed:
+            try:
+                task = await self.queue.pop()
+                if task is None:
+                    break
+                await self._run_task(task)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - one bad task must not kill the loop
+                log.exception("task loop iteration failed")
+
+    async def _run_task(self, task: "Task") -> None:
+        """Run one queued task and deliver its result to the right place."""
+        channel = task.channel
+        status: discord.Message | None = None
+        try:
+            if task.priority == TaskQueue.USER:
+                status = await channel.send("🤔 Working on it…")
+                started = time.monotonic()
+                async with channel.typing():
+                    result = await self._execute(
+                        channel, task.user_id, task.prompt,
+                        self._step_callback(status, asyncio.get_running_loop(),
+                                            task.max_steps or self.cfg.max_steps),
+                        tool_names=task.tool_names, max_steps=task.max_steps,
+                        issue_budget=task.issue_budget, timeout=task.timeout,
+                    )
+                header = (task.header + "\n") if task.header else ""
+                reply = header + (result.text.strip() or "(the model returned an empty answer)")
+                reply += f"\n-# {result.model} · {result.steps} step(s) · {time.monotonic() - started:.0f}s"
+                if task.remember:
+                    turns = self.history.setdefault(channel.id, deque(maxlen=self.cfg.history_turns))
+                    turns.append((str(task.prompt)[:800], result.text[:800]))
+                await self._deliver_reply(task.message, channel, reply, status)
+            else:  # proactive: run quietly, deliver via the notify policy
+                result = await self._execute(
+                    channel, task.user_id, task.prompt,
+                    self._step_callback(None, asyncio.get_running_loop(),
+                                        task.max_steps or self.cfg.max_steps),
+                    tool_names=task.tool_names, max_steps=task.max_steps,
+                    issue_budget=task.issue_budget, timeout=task.timeout,
+                )
+                header = (task.header + "\n") if task.header else ""
+                text = header + (result.text.strip() or "(the model returned an empty answer)")
+                text += f"\n-# {result.model} · {result.steps} step(s)"
+                await self._notify_proactive(text)
+        except Exception as e:  # noqa: BLE001 - always answer the requester
+            error_text = explain_error(e, self.cfg)
+            if task.priority == TaskQueue.USER:
+                await self._deliver_reply(task.message, channel, error_text, status)
+            else:
+                await self._notify_proactive(error_text)
+        finally:
+            if task.done is not None:
+                task.done.set()
+            await self.queue.mark_done()
+
+    async def _deliver_reply(self, message: discord.Message | None, channel, text: str, status) -> None:
+        """Replace the in-progress status message with the final reply, chunked."""
+        try:
+            if status is not None:
+                await status.delete()
+        except discord.HTTPException:
+            pass
+        for i, part in enumerate(chunk_message(text)):
+            try:
+                if i == 0 and message is not None:
+                    await message.reply(part, mention_author=False)
+                else:
+                    await channel.send(part)
+            except discord.HTTPException:
+                try:
+                    await channel.send(part)
+                except discord.HTTPException:
+                    pass
+
+    # -------------------------------------------------------- proactive notify policy
+
+    def _in_quiet_hours(self) -> bool:
+        """True if now is inside QUIET_HOURS (24h, may cross midnight)."""
+        wh = self.cfg.quiet_hours
+        if not wh:
+            return False
+        try:
+            start_s, end_s = (s.strip() for s in wh.split("-"))
+            sh, sm = (int(x) for x in start_s.split(":"))
+            eh, em = (int(x) for x in end_s.split(":"))
+        except ValueError:
+            return False
+        now = datetime.now(ZoneInfo(self.cfg.timezone))
+        start = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end = now.replace(hour=eh, minute=em, second=0, microsecond=0)
+        if start <= end:
+            return start <= now < end
+        return now >= start or now < end
+
+    def _cap_headroom(self) -> int:
+        """Proactive notifications still allowed today. -1 = no cap."""
+        cap = self.cfg.proactive_per_day
+        if cap <= 0:
+            return -1
+        tz = ZoneInfo(self.cfg.timezone)
+        today_start = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+        since = today_start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return cap - self.state.count_proactive_since(since)
+
+    def _cap_ok(self) -> bool:
+        return self._cap_headroom() == -1 or self._cap_headroom() >= 1
+
+    async def _notify_proactive(self, text: str) -> None:
+        """Deliver a proactive notification: batch through quiet hours and cap
+        the total per bot-local day. USER results are never routed here."""
+        if self._in_quiet_hours():
+            self._pending_alerts.append(text)
+            return
+        if not self._cap_ok():
+            self.friction.record("proactive_cap",
+                                 detail=f"per-day proactive cap reached; dropped {text[:120]!r}")
+            return
+        self.state.record_proactive()
+        await self._notify(text)
+
+    async def _flush_pending_alerts(self) -> None:
+        """Send quiet-hours-batched proactive alerts once the window has opened."""
+        if not self._pending_alerts:
+            return
+        if self._in_quiet_hours():
+            return
+        if not self._cap_ok():
+            self.friction.record("proactive_cap_flush",
+                                 detail=f"dropped {len(self._pending_alerts)} queued proactive alert(s) (per-day cap)")
+            self._pending_alerts.clear()
+            return
+        batch = "\n".join(self._pending_alerts)
+        self._pending_alerts.clear()
+        self.state.record_proactive()
+        await self._notify(batch)
+
+    async def _alert_flush_loop(self):
+        await self.wait_until_ready()
+        while True:
+            try:
+                await self._flush_pending_alerts()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                log.exception("alert flush failed")
+            await asyncio.sleep(30)
+
+    # -------------------------------------------------------- event routing
+
+    def _task_for_event(self, event: RepoEvent) -> "Task | None":
+        """Dispatch a RepoEvent to a queued proactive task (features 2-4).
+
+        Every kind routes through the shared TaskQueue + notify policy exactly
+        like the scheduled self-review, so the same safety net (quiet hours,
+        per-day cap, per-task timeout, queue cap) applies. The per-kind task
+        bodies (ci-fix, auto-review) are filled in by the follow-up PR; the
+        consumer below already dedupes and enqueues, so wiring them is a drop-in.
+        """
+        if event.repo not in self.cfg.github_allowed_repos:
+            return None
+        if event.kind == KIND_CI_FAILED:
+            # Follow-up PR: return a "ci-fix" Task when
+            # cfg.ci_autofix in {"diagnose", "fix"} (bounded by ci_fix_max_attempts).
+            return None
+        if event.kind == KIND_PR_OPENED:
+            # Follow-up PR: return an "auto-review" Task when
+            # cfg.auto_review in {"ask", "post"}.
+            return None
+        return None
+
+    async def _event_consumer(self):
+        """Single consumer of the EventBus: dedupes each event via the state
+        store and routes the survivors through _task_for_event."""
+        while True:
+            try:
+                event = await self.bus.get(timeout=1.0)
+                if event is not None:
+                    if not self.state.record_delivery(event.delivery_id):
+                        log.debug("duplicate delivery %s (kind=%s repo=%s)",
+                                   event.delivery_id, event.kind, event.repo)
+                    else:
+                        task = self._task_for_event(event)
+                        if task is not None:
+                            await self.queue.enqueue(task)
+                        else:
+                            log.info("event %s (kind=%s repo=%s pr=%s) has no handler yet",
+                                     event.delivery_id, event.kind, event.repo, event.pr_number)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                log.exception("event consumer failed")
+            await asyncio.sleep(0.1)
 
     # -------------------------------------------------------- approvals
 
@@ -510,7 +869,7 @@ class Bot(discord.Client):
                 today = datetime.now(ZoneInfo(cfg.timezone)).date().isoformat()
                 if self.watcher.state.get("last_review_day") != today:
                     self.watcher.state["last_review_day"] = today
-                    await self._notify(await self.do_self_review())
+                    await self.do_self_review()
                 await asyncio.sleep(90)
             except asyncio.CancelledError:
                 raise
@@ -518,28 +877,52 @@ class Bot(discord.Client):
                 log.exception("weekly self-review failed")
                 await asyncio.sleep(3600)
 
-    async def do_self_review(self, force: bool = False, channel=None) -> str:
-        """Turn recorded friction into GitHub issues on our own repo. Returns text for the owner.
+    async def do_self_review(
+        self, force: bool = False, message: discord.Message | None = None
+    ):
+        """Turn recorded friction into GitHub issues on our own repo.
 
-        Costs LLM requests, so it is skipped when there's too little to learn from."""
+        `message` given (user-initiated `!improve`): USER-priority task whose
+        result is replied to `message` (and awaited). `message` None (the
+        scheduled weekly review): PROACTIVE task delivered via the notify policy
+        (quiet hours + per-day cap), fire-and-forget. Returns the skip text
+        (replied to `message` when given), else None (a task was queued)."""
         cfg, w = self.cfg, self.watcher
         since = w.state.get("last_review_ts")
         report, problems, has_notes = self.runner.friction.summary(days=7, since=since)
         if problems == 0 or (problems < cfg.self_review_min_events and not has_notes and not force):
-            return (
+            skip_msg = (
                 f"🔍 Self-review: {problems} problem event(s) since the last review "
                 f"(threshold {cfg.self_review_min_events}), so nothing to review. `!friction` shows the log."
             )
+            if message is not None:
+                for part in chunk_message(skip_msg):
+                    await message.reply(part, mention_author=False)
+            return skip_msg
         prompt = REVIEW_PROMPT.format(repo=cfg.self_repo, report=report)
-        async with self.lock:
-            target = channel or await self._notify_target()
-            result = await self._execute(
-                target, cfg.primary_user_id, prompt, lambda step, agent=None: None,
-                tool_names=REVIEW_TOOLS, max_steps=cfg.improve_max_steps, issue_budget=3,
-            )  # fmt: skip
+        channel = message.channel if message is not None else await self._notify_target()
+        task = Task(
+            kind="self-review",
+            prompt=prompt,
+            message=message,
+            channel=channel,
+            user_id=message.author.id if message is not None else cfg.primary_user_id,
+            tool_names=REVIEW_TOOLS,
+            max_steps=cfg.improve_max_steps,
+            remember=False,
+            issue_budget=3,
+            header=f"🔍 **Self-review** ({problems} problem event(s))",
+            timeout=cfg.proactive_task_timeout_s,
+            priority=TaskQueue.USER if message is not None else TaskQueue.PROACTIVE,
+            done=asyncio.Event(),
+        )
+        await self.queue.enqueue(task)
         w.state["last_review_ts"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         await asyncio.to_thread(w.save)
-        return f"🔍 **Self-review** ({problems} problem event(s))\n{result.text.strip() or '(no summary)'}\n-# {result.model} · {result.steps} step(s)"
+        if message is not None:
+            self._start_consumer()
+            await task.done.wait()
+        return None
 
     def _repo_status(self) -> str:
         cfg = self.cfg
@@ -566,7 +949,7 @@ class Bot(discord.Client):
 
     async def _cmd_update(self, message: discord.Message, say) -> None:
         cfg, up = self.cfg, self.updater
-        if self.lock.locked():
+        if await self.queue.is_busy():
             return await say("I'm in the middle of a task. Try again when it's done (or `!stop` it).")
         try:
             async with message.channel.typing():
@@ -605,7 +988,7 @@ class Bot(discord.Client):
         await self._restart(say, f"✅ Updated to `{plan.target[:7]}` and checked. Restarting…")
 
     async def _cmd_rollback(self, message: discord.Message, say) -> None:
-        if self.lock.locked():
+        if await self.queue.is_busy():
             return await say("I'm in the middle of a task. Try again when it's done.")
         st = self.updater.read_state()
         if not st.get("previous") or st.get("state") == "rolled_back":
@@ -659,12 +1042,23 @@ class Bot(discord.Client):
                     + (f", digest {cfg.digest_time} {cfg.timezone}" if cfg.digest_time else "")
                     + (f"\n⚠️ {w.last_error}" if w.last_error else "")
                 )
+            busy = await self.queue.is_busy()
+            queued = await self.queue.queued()
+            pro = await self.queue.proactive_pending()
+            headroom = self._cap_headroom()
+            headroom_str = (f"{headroom} proactive left today" if headroom >= 0
+                            else "no per-day cap")
+            queue_desc = (
+                f"**{busy and 'busy' or 'idle'}** · {queued} queued · "
+                f"{pro} proactive pending · {headroom_str}"
+            )
             await say(
                 f"**Server**\n{system_report(cfg.timezone)}\n\n**LLM**\n{self.runner.model.describe()}\n\n"
                 f"**Watcher**: {watch}\n"
                 f"**Agent**: {cfg.agent_type} · max {cfg.max_steps} steps · approvals: {cfg.approval_mode} · "
                 f"GitHub writes: {'on' if cfg.github_write and cfg.github_token else 'off'} · notes: {len(mem.all())}\n"
                 f"**Repos**: {self._repo_status()}\n"
+                f"**Queue**: {queue_desc}\n"
                 f"**Self**: {self._self_status()}"
             )
         elif cmd == "!llmlog":
@@ -740,10 +1134,9 @@ class Bot(discord.Client):
             if not self.self_ready:
                 await say(self._self_off_reason())
             else:
-                if self.lock.locked():
-                    await say("⏳ Busy; the review will start when the current task ends.")
-                async with message.channel.typing():
-                    await say(await self.do_self_review(force=arg.lower() == "force", channel=message.channel))
+                # User-initiated: USER-priority, result replied here; awaited so this
+                # command returns with an answer.
+                await self.do_self_review(force=arg.lower() == "force", message=message)
         elif cmd == "!implement":
             n = arg.lstrip("#")
             if not self.self_ready:
@@ -777,7 +1170,7 @@ class Bot(discord.Client):
         past = "\n".join(f"User: {u}\nAssistant: {a}" for u, a in turns)
         return f"Earlier in this conversation:\n{past}\n\nNew request from the user:\n{text}"
 
-    def _step_callback(self, status: discord.Message, loop: asyncio.AbstractEventLoop, total_steps: int):
+    def _step_callback(self, status: discord.Message | None, loop: asyncio.AbstractEventLoop, total_steps: int):
         last = {"t": 0.0}
         total = total_steps
 
@@ -799,17 +1192,23 @@ class Bot(discord.Client):
                 what = "🧠 thinking…" + (f" ({snippet}…)" if snippet else "")
             log.info("step %s/%s: %s", step.step_number, total, what)
             now = time.monotonic()
-            if now - last["t"] >= 2.0:  # stay well under Discord's edit rate limit
+            if status is not None and now - last["t"] >= 2.0:  # proactive tasks have no status message
                 last["t"] = now
                 asyncio.run_coroutine_threadsafe(_safe_edit(status, f"⚙️ Step {step.step_number}/{total} done: {what}"), loop)
 
         return on_step
 
-    async def _execute(self, channel, user_id: int, prompt: str, on_step, *, tool_names=None, max_steps=None, issue_budget: int = 0) -> RunResult:
-        """Run one agent task. The caller must hold self.lock."""
+    async def _execute(self, channel, user_id: int, prompt: str, on_step, *, tool_names=None, max_steps=None, issue_budget: int = 0, timeout: float | None = None) -> RunResult:
+        """Run one agent task. The task loop serializes execution via the queue.
+
+        `timeout` is a per-task wall-clock cap (None => cfg.run_timeout). Proactive
+        tasks pass cfg.proactive_task_timeout_s so background work can't starve chat."""
         self.run_ctx = RunContext(channel, user_id, asyncio.get_running_loop())
         try:
-            return await self.runner.run(prompt, on_step, tool_names=tool_names, max_steps=max_steps, issue_budget=issue_budget)
+            return await self.runner.run(
+                prompt, on_step, tool_names=tool_names, max_steps=max_steps,
+                issue_budget=issue_budget, timeout=timeout,
+            )
         finally:
             self.run_ctx = None
 
@@ -823,39 +1222,31 @@ class Bot(discord.Client):
         max_steps: int | None = None,
         remember: bool = True,
     ):
+        """Enqueue a USER task. The queue's single consumer runs it and replies;
+        when work is already running we reassure the user that it will follow."""
         channel = message.channel
-        if self.lock.locked():
+        if await self.queue.is_busy():
             await channel.send("⏳ Busy with another task - yours is next.")
-        async with self.lock:
-            loop = asyncio.get_running_loop()
-            status = await channel.send("🤔 Working on it…")
-            started = time.monotonic()
-            try:
-                async with channel.typing():
-                    effective_max_steps = max_steps or self.cfg.max_steps
-                    result = await self._execute(
-                        channel, message.author.id, prompt or self._prompt(channel.id, text), self._step_callback(status, loop, effective_max_steps),
-                        tool_names=tool_names, max_steps=max_steps,
-                    )  # fmt: skip
-                reply = result.text.strip() or "(the model returned an empty answer)"
-                reply += f"\n-# {result.model} · {result.steps} step(s) · {time.monotonic() - started:.0f}s"
-                if remember:
-                    turns = self.history.setdefault(channel.id, deque(maxlen=self.cfg.history_turns))
-                    turns.append((text[:800], result.text[:800]))
-            except Exception as e:  # noqa: BLE001 - always answer the user
-                reply = explain_error(e, self.cfg)
-            try:
-                await status.delete()
-            except discord.HTTPException:
-                pass
-            for i, part in enumerate(chunk_message(reply)):
-                try:
-                    if i == 0:
-                        await message.reply(part, mention_author=False)
-                    else:
-                        await channel.send(part)
-                except discord.HTTPException:
-                    await channel.send(part)
+        task = Task(
+            kind="user",
+            prompt=prompt or self._prompt(channel.id, text),
+            message=message,
+            channel=channel,
+            user_id=message.author.id,
+            tool_names=tool_names,
+            max_steps=max_steps,
+            remember=remember,
+            issue_budget=0,
+            header=None,
+            timeout=None,
+            priority=TaskQueue.USER,
+            done=asyncio.Event(),
+        )
+        await self.queue.enqueue(task)
+        self._start_consumer()
+        # User-initiated work: wait for the consumer to reply before returning,
+        # so on_message completes when the user's message has an answer.
+        await task.done.wait()
 
 
 def main() -> None:

@@ -286,10 +286,11 @@ async def main():
     bot5 = M.Bot(upd_cfg)
     bot5._connection.user = NS(id=999)
     bot5.updater = Updater(work, github_token="")
-    async with bot5.lock:
-        m = user_msg("!update")
-        await bot5.on_message(m)
+    bot5.queue._running = True
+    m = user_msg("!update")
+    await bot5.on_message(m)
     assert "middle of a task" in m.replies[0]
+    bot5.queue._running = False
     ok("!update refused while a task is already running")
 
     # failing CI blocks the update
