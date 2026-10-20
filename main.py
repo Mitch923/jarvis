@@ -37,6 +37,7 @@ from state import State
 from tools import LOCKED_PATHS, RunState, build_tools, system_report
 from updater import APP_DIR, UpdateError, Updater, ci_state
 from watcher import Watcher, seconds_until
+from webhooks import WebhookServer
 
 log = logging.getLogger("agent")
 
@@ -477,6 +478,7 @@ class Bot(discord.Client):
         self._consumer_task: asyncio.Task | None = None
         self._pending_alerts: list[str] = []
         self.last_event_at: float | None = None
+        self.webhook: WebhookServer | None = None
         self.webhook_last_event: float | None = None
 
     def _start_consumer(self) -> None:
@@ -541,9 +543,19 @@ class Bot(discord.Client):
                 log.info("Weekly self-review of %s: day %d at %s %s", cfg.self_repo, cfg.self_review_day, cfg.self_review_time, cfg.timezone)
             else:
                 log.info("Weekly self-review off: %s", self._self_off_reason())
+        # Webhook receiver (Feature 1): live in the bot's event loop, started
+        # alongside the other background jobs. Polling stays as the fallback.
+        if cfg.webhook_enabled and self.webhook is None:
+            self.webhook = WebhookServer(cfg, self.state, self.bus, notify=self._notify_proactive)
+            try:
+                await self.webhook.start()
+            except Exception:  # never crash the bot over the webhook
+                log.exception("webhook receiver failed to start; continuing without it")
 
     async def close(self):
         self.queue.close()
+        if self.webhook is not None:
+            await self.webhook.stop()
         for job in self._jobs:
             job.cancel()
         await asyncio.gather(*self._jobs, return_exceptions=True)
@@ -1052,6 +1064,16 @@ class Bot(discord.Client):
                 f"**{busy and 'busy' or 'idle'}** · {queued} queued · "
                 f"{pro} proactive pending · {headroom_str}"
             )
+            # Webhook receiver status: listening or not, plus how fresh the last event is.
+            if not cfg.webhook_enabled:
+                wh = "off (WEBHOOK_ENABLED=0)"
+            elif self.webhook is not None and self.webhook.started:
+                last = (f"{int(time.time() - self.webhook.last_event)}s ago"
+                        if self.webhook.last_event else "not yet")
+                wh = (f"up · listening on {cfg.webhook_bind}:{cfg.webhook_port} · "
+                      f"last event {last}")
+            else:
+                wh = "enabled but not listening (port in use? see journalctl -u jarvis)"
             await say(
                 f"**Server**\n{system_report(cfg.timezone)}\n\n**LLM**\n{self.runner.model.describe()}\n\n"
                 f"**Watcher**: {watch}\n"
@@ -1059,6 +1081,7 @@ class Bot(discord.Client):
                 f"GitHub writes: {'on' if cfg.github_write and cfg.github_token else 'off'} · notes: {len(mem.all())}\n"
                 f"**Repos**: {self._repo_status()}\n"
                 f"**Queue**: {queue_desc}\n"
+                f"**Webhook**: {wh}\n"
                 f"**Self**: {self._self_status()}"
             )
         elif cmd == "!llmlog":

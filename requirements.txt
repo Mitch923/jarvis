@@ -1,6 +1,7 @@
 # Tested with these versions (smolagents' Model/agent API changes between releases, so keep the lower bound)
 smolagents[openai]>=1.26,<2   # pulls openai, requests, rich, jinja2, pillow, python-dotenv
 discord.py>=2.4,<3
+aiohttp>=3.8,<4               # GitHub webhook receiver (webhooks.py); also a transitive dep of discord.py
 ddgs>=9,<10                  # DuckDuckGo search, no API key
 markdownify>=1.0              # HTML -> Markdown for visit_webpage
 numpy>=1.24,<3                # Required for test_memory.py mock embeddings

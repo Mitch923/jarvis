@@ -50,6 +50,10 @@ class RepoEvent:
     run_id: int | None
     actor: str | None
     received_at: float  # time.time() at first reception
+    # Only set by the webhook receiver for pull_request events. For fork PRs this is
+    # the fork's "owner/name" (and differs from `repo`); handlers refuse to push to a
+    # fork when `head_repo is not None and head_repo != repo`.
+    head_repo: str | None = None
 
 
 class EventBus:

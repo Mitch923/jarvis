@@ -52,6 +52,7 @@ main.py
   ├─► friction.py
   ├─► memory.py
   ├─► watcher.py
+  ├─► webhooks.py
   ├─► updater.py
   ├─► events.py
   ├─► state.py
@@ -99,6 +100,37 @@ answer always delivers.
 **`!status` queue line.** Now reports
 `**Queue**: **{busy/idle}** · {N} queued · {M} proactive pending · {K} proactive
 left today`, so background congestion is visible at a glance.
+
+## Webhook events (optional)
+
+When `WEBHOOK_ENABLED=1` ([docs/WEBHOOKS.md](WEBHOOKS.md)) an aiohttp
+`WebhookServer` shares the bot's event loop and turns live GitHub events into the
+*same* `RepoEvent` stream the watcher produces — so both are just two sources into
+the same bus, deduped by delivery id:
+
+```
+GitHub ──► POST /webhook/github (+ X-Hub-Signature-256, X-GitHub-Delivery)
+                │
+                ▼
+WebhookServer._github (webhooks.py)   [fast, sync, no network/LLM]
+  HMAC-SHA256 over raw body → JSON →
+  dedupe by delivery-id → repo allowlist → map to RepoEvent
+                │
+                ▼
+EventBus.put(event)
+                │
+                ▼
+TaskQueue consumer (_task_for_event)  ◄── same consumer the watcher uses
+                │
+                ▼
+   PROACTIVE tasks: diagnosis / review / fix (quiet hours + per-day cap)
+```
+
+`watcher.py` polling keeps running as a fallback (no LLM cost); the two agree on
+event kinds and dedupe by `X-GitHub-Delivery`, so a webhook that already marked a
+delivery seen won't be re-reported by the next poll. The HTTP handler returns in
+<100 ms because it does only local work — all slow work lives downstream in the
+same consumer as polling.
 
 ## Approval flow
 
