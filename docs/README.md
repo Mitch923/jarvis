@@ -6,4 +6,4 @@
 - [Long-term memory](MEMORY.md) — `data/memory.json`, `!remember`/`!forget`, approval before write
 - [Self-improvement](SELF_IMPROVEMENT.md) — friction log, weekly review (`!improve`), `!implement`, protected files, `!update`/`!rollback`
 - [Security model](SECURITY.md) — allowlists, branch guards, protected files, sandbox isolation, SSRF, privacy
-- [Architecture](ARCHITECTURE.md) — request flow, module graph, approval flow, self-improvement loop, guardrails table
+- [Architecture](ARCHITECTURE.md) — request flow, module graph, shared event/state layer (queue + proactive notify), approval flow, self-improvement loop, guardrails table

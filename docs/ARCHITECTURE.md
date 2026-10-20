@@ -53,6 +53,8 @@ main.py
   ├─► memory.py
   ├─► watcher.py
   ├─► updater.py
+  ├─► events.py
+  ├─► state.py
   ├─► config.py
   └─► ghclient.py
 ```
@@ -60,6 +62,43 @@ main.py
 **Near-collisions to be aware of:**
 - `checkouts.py` vs `tools/repo_tools.py` — the latter is the tool wrapper around the former
 - `memory.py` vs `tools/notes.py` — the latter is the tool wrapper around the former
+
+## Shared event/state layer
+
+One process drives everything: a single consumer (`events.py:TaskQueue._task_loop`)
+runs all queued tasks one at a time, and `state.py` is a file-backed JSON store
+(one section per feature, pruned, survives restarts).
+
+**`TaskQueue` (single-consumer, priority).** Every task carries a `priority`
+(`USER` = 0, `PROACTIVE` = 1) and a monotonically increasing `seq`. The consumer
+always pops the highest-priority, oldest-`seq` task first, so a user's live request
+preempts the background work queued behind it; within a priority level it is FIFO.
+`is_busy()` reports whether a task is running; `queued()` and `proactive_pending()`
+report backlog; `mark_done()` / `close()` bookend a task. USER tasks reply to their
+own message; PROACTIVE tasks go through the notify policy below.
+
+**PROACTIVE queue cap** (`PROACTIVE_QUEUE_MAX`, default 10). When the background
+queue already holds that many PROACTIVE tasks, a newly enqueued one evicts the
+*oldest* PROACTIVE task (by `seq`) and records a `proactive_queue_full` friction
+event. USER tasks are never evicted this way — only the background layer sheds load.
+
+**Proactive notify policy** (quiet hours + per-day cap, in `main.py`).
+`_notify_proactive` is the only path for background alerts (weekly self-review,
+daily digest, fix attempts, queue-full). Two gates, checked in order:
+- *Per-day cap* (`PROACTIVE_MAX_PER_DAY`; 0 = no cap) — counted against
+  `state.proactive_log`. Over the cap, the alert is dropped (not sent) and recorded
+  as a `proactive_cap` friction event.
+- *Quiet hours* (`QUIET_HOURS`, a 24h window that may cross midnight, e.g.
+  `22:00-04:00`). Inside the window, alerts buffer into `_pending_alerts` and the
+  `_alert_flush_loop` job joins them and sends **one** combined message when the
+  window reopens, so the user gets a single digest rather than a 3 a.m. ping.
+
+User-initiated task results bypass both gates — a user's `!improve` or task
+answer always delivers.
+
+**`!status` queue line.** Now reports
+`**Queue**: **{busy/idle}** · {N} queued · {M} proactive pending · {K} proactive
+left today`, so background congestion is visible at a glance.
 
 ## Approval flow
 

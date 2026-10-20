@@ -89,6 +89,22 @@ class Config:
     watch_interval: float  # seconds between GitHub polls; 0 = watcher off
     digest_time: str  # "HH:MM" in AGENT_TIMEZONE; "" = no daily digest
 
+    # --- Proactive / webhooks (features 2-5) ---
+    webhook_enabled: bool  # receive real GitHub webhooks (needs WEBHOOK_SECRET)
+    webhook_bind: str
+    webhook_port: int
+    webhook_secret: str
+    ci_autofix: str  # "off" | "diagnose" | "fix" — auto-fix on newly failing CI
+    ci_fix_max_attempts: int  # attempts per PR before "give up" and telling the user
+    auto_review: str  # "off" | "ask" | "post" — auto-review on newly opened PRs
+    auto_review_drafts: bool  # post draft reviews (safe) before full public ones
+    auto_review_skip_own: bool  # skip auto-review of PRs by the owner's own accounts
+    auto_review_max_diff_lines: int  # diffs longer than this are summarised, not reviewed
+    quiet_hours: str  # "HH:MM-HH:MM" (24h, may cross midnight); proactive alerts wait until it opens
+    proactive_per_day: int  # proactive notifications per bot-local day; 0 = no cap
+    proactive_queue_max: int  # max proactive tasks in the queue before the oldest is dropped
+    proactive_task_timeout_s: float  # wall-clock cap for a proactive (background) task
+
     # --- Self-improvement ---
     self_repo: str  # this bot's own GitHub repo (owner/name); blank = detect from the git checkout
     self_review_day: int  # 0=Mon .. 6=Sun, -1 = weekly review off
@@ -152,6 +168,38 @@ class Config:
         digest = _str("DIGEST_TIME", "08:00")
         if digest and not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", digest):
             raise ConfigError("DIGEST_TIME must be HH:MM (24h), or empty to disable")
+
+        ci_autofix = _str("CI_AUTOFIX", "diagnose").lower()
+        if ci_autofix not in {"off", "diagnose", "fix"}:
+            raise ConfigError(f"CI_AUTOFIX must be one of off, diagnose, fix: {ci_autofix!r}")
+
+        auto_review = _str("AUTO_REVIEW", "ask").lower()
+        if auto_review not in {"off", "ask", "post"}:
+            raise ConfigError(f"AUTO_REVIEW must be one of off, ask, post: {auto_review!r}")
+
+        quiet_hours = _str("QUIET_HOURS")
+        if quiet_hours and not re.fullmatch(
+            r"([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d", quiet_hours
+        ):
+            raise ConfigError("QUIET_HOURS must be 'HH:MM-HH:MM' (24h, may cross midnight) or empty")
+
+        proactive_per_day = _int("PROACTIVE_MAX_PER_DAY", 0)
+        if proactive_per_day < 0:
+            raise ConfigError("PROACTIVE_MAX_PER_DAY must be >= 0")
+        proactive_queue_max = _int("PROACTIVE_QUEUE_MAX", 10)
+        if proactive_queue_max < 1:
+            raise ConfigError("PROACTIVE_QUEUE_MAX must be >= 1")
+        proactive_task_timeout = _float("PROACTIVE_TASK_TIMEOUT_S", 600.0)
+        if proactive_task_timeout <= 0:
+            raise ConfigError("PROACTIVE_TASK_TIMEOUT_S must be > 0")
+
+        webhook_enabled = _bool("WEBHOOK_ENABLED", False)
+        webhook_port = _int("WEBHOOK_PORT", 8787)
+        if webhook_port < 0 or webhook_port > 65535:
+            raise ConfigError("WEBHOOK_PORT must be 0-65535")
+        webhook_secret = _str("WEBHOOK_SECRET")
+        if webhook_enabled and not webhook_secret:
+            raise ConfigError("WEBHOOK_ENABLED=1 requires WEBHOOK_SECRET")
 
         agent_type = _str("AGENT_TYPE", "tool").lower()
         if agent_type not in {"tool", "code"}:
@@ -259,4 +307,18 @@ class Config:
             sandbox_network=sandbox_network,
             sandbox_network_allowed_repos=sandbox_network_allowed_repos,
             test_commands=test_commands,
+            ci_autofix=ci_autofix,
+            ci_fix_max_attempts=max(1, _int("CI_FIX_MAX_ATTEMPTS", 2)),
+            auto_review=auto_review,
+            auto_review_drafts=_bool("AUTO_REVIEW_DRAFTS", False),
+            auto_review_skip_own=_bool("AUTO_REVIEW_SKIP_OWN", True),
+            auto_review_max_diff_lines=max(1, _int("AUTO_REVIEW_MAX_DIFF_LINES", 1500)),
+            quiet_hours=quiet_hours,
+            proactive_per_day=proactive_per_day,
+            proactive_queue_max=proactive_queue_max,
+            proactive_task_timeout_s=proactive_task_timeout,
+            webhook_enabled=webhook_enabled,
+            webhook_bind=_str("WEBHOOK_BIND", "127.0.0.1"),
+            webhook_port=webhook_port,
+            webhook_secret=webhook_secret,
         )
