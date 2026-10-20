@@ -2,7 +2,7 @@
 
 A small Discord-driven AI agent for a home server, built on [smolagents](https://github.com/huggingface/smolagents) with free LLM providers.
 
-**Can do:** answer questions with web search · read your GitHub repos, commits, issues, PRs and **CI status** · review PR diffs and post review comments · edit code on `agent/*` branches and open PRs · **check out repos locally for fast reads/search, and run their own tests in a sandbox before opening a PR** · **remember your preferences** · **watch your repos and DM you** about new PRs and failing builds · post a **daily digest** · **review its own pain points weekly and file issues against itself, then draft a PR when you ask it to implement one** · update itself via `!update` with automatic rollback · **fall back across multiple free LLM providers** when one runs dry · report server health.
+**Can do:** answer questions with web search · read your GitHub repos, commits, issues, PRs and **CI status** · review PR diffs and post review comments · edit code on `agent/*` branches and open PRs · **check out repos locally for fast reads/search, and run their own tests in a sandbox before opening a PR** · **remember your preferences** · **watch your repos and DM you** about new PRs and failing builds — **via live webhooks in seconds, with polling as a fallback** · post a **daily digest** · **review its own pain points weekly and file issues against itself, then draft a PR when you ask it to implement one** · update itself via `!update` with automatic rollback · **fall back across multiple free LLM providers** when one runs dry · report server health.
 
 ```
 main.py           Discord bot, commands, approvals (buttons), background jobs, agent runner
@@ -12,6 +12,7 @@ ghclient.py       GitHub REST client (retries, readable errors, CI helper, share
 checkouts.py      local git clones of allowed repos: fast reads, full-text search (git grep)
 sandbox.py        runs a repo's own tests in an ephemeral Docker/Podman container
 watcher.py        PR / CI watcher and the daily digest (no LLM)
+webhooks.py       GitHub webhook receiver (POST /webhook/github, HMAC, delivery dedupe, no LLM)
 memory.py         long-term notes (JSON file)
 friction.py       runtime pain-point log that feeds the weekly self-review (no LLM)
 updater.py        self-update: fast-forward, CI gate, smoke test, automatic rollback
@@ -75,7 +76,7 @@ DM the bot, `@mention` it, or (if `DISCORD_CHANNEL_IDS` is set) just talk in tha
 
 | Command | |
 |---|---|
-| `!status` | Server health, LLM request counts / provider cooldowns, watcher, repo checkouts, config |
+| `!status` | Server health, LLM request counts / provider cooldowns, watcher, webhook receiver, repo checkouts, config |
 | `!stop` | Cancel the running task (also interrupts LLM retry waits) |
 | `!reset` | Forget this channel's conversation (long-term notes are kept) |
 | `!digest` | Snapshot of every allowlisted repo now |
@@ -96,6 +97,7 @@ Only one task runs at a time; others queue.
 - [Multi-provider LLM](docs/PROVIDERS.md)
 - [Local checkouts & sandboxed tests](docs/CHECKOUTS_AND_SANDBOX.md)
 - [Watcher & daily digest](docs/WATCHER.md)
+- [GitHub webhook receiver](docs/WEBHOOKS.md)
 - [Long-term memory](docs/MEMORY.md)
 - [Self-improvement](docs/SELF_IMPROVEMENT.md)
 - [Security model](docs/SECURITY.md)
@@ -108,6 +110,7 @@ Only one task runs at a time; others queue.
 - **GitHub writes**: only to `agent/*` branches; no merge/delete tool; PRs opened by agent are drafts; reviews are `COMMENT` only.
 - **Local checkouts**: read-only from agent's view — `repo_sync` hard-resets and cleans every use; real changes go through GitHub API.
 - **Sandboxed tests**: ephemeral `--rm` container, no host secrets, resource limits, optional `network=none` — see [Security model](docs/SECURITY.md) for full threat model.
+- **Webhooks** (`WEBHOOK_ENABLED`): `POST /webhook/github` is bound to `127.0.0.1`, HMAC-signed and repo-allowlisted — don't expose it on a router.
 - **Self-editing**: restricted by protected-files list; friction log written by runtime (not model); `!update` only fast-forwards to commits with passing CI.
 - **Untrusted content**: web pages, files, issues, PR text, test output marked as data; approval buttons are the real backstop.
 - **Privacy**: free-tier providers may log/train on prompts; `GITHUB_ALLOWED_REPOS` keeps sensitive repos out of reach; Ollama keeps requests on your network.
